@@ -29,14 +29,18 @@ from typing import Any
 
 import httpx
 
-import os
+# 让独立包也能 import 项目 src 下的 mail_backend（Emailnator 主路径）
+_SRC = Path(__file__).resolve().parent.parent.parent / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+from qoder2api.mail_backend import create_mailbox as _mail_create, wait_code as _mail_wait  # noqa: E402
 
-APP_DIR = Path(__file__).resolve().parent.parent  # 项目根
+APP_DIR = Path(__file__).resolve().parent.parent.parent  # 项目根（QoderGateway，而非 qodergate-register/）
 
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
-YYDS_API = "https://maliapi.215.im/v1"
+YYDS_API = "https://vip.215.im/v1"  # 默认基址；如需换域名，用 YYDS_API_BASE 覆盖（旧域名 maliapi.215.im 已失效）
 REGISTER_URL = "https://qoder.com/users/sign-up"
 SUCCESS_URL_MARK = "/download"
 DEVICE_CLIENT_ID = "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb"
@@ -155,23 +159,76 @@ def _yyds_key() -> str | None:
     return None
 
 
-def yyds_create_mailbox(prefix: str = "qoder", task_id: str | None = None) -> str:
+def _yyds_api() -> str:
+    """动态读取 YYDS 邮箱 API 基址：环境变量 YYDS_API_BASE 优先，其次项目根 .env，最后回落到默认值。
+    不模块级固化：该服务域名曾从 maliapi.215.im 迁移到 vip.215.im。"""
+    base = (os.getenv("YYDS_API_BASE") or "").strip()
+    if base:
+        return base.rstrip("/")
+    try:
+        env_path = APP_DIR / ".env"
+        if env_path.exists():
+            for raw in env_path.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if line.startswith("YYDS_API_BASE="):
+                    base = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if base:
+                        os.environ.setdefault("YYDS_API_BASE", base)
+                        return base.rstrip("/")
+    except Exception:
+        pass
+    return YYDS_API
+
+
+def _pick_yyds_domain() -> str | None:
+    """从项目根 yyds_clean_domains.txt 随机挑一个"非 qzz.io"干净域。
+
+    qzz.io 系列域名被 qoder 判定为临时域、拒收验证码，必须显式避开；
+    domain 参数缺省时用它建箱，避免 YYDS API 随机选域（含 qzz.io 风险）。
+    文件缺失或池为空时返回 None（由 YYDS API 兜底随机选域）。
+    """
+    clean_file = Path(__file__).resolve().parent.parent.parent / "yyds_clean_domains.txt"
+    try:
+        lines = [
+            ln.strip()
+            for ln in clean_file.read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+    except Exception:
+        return None
+    candidates = [d for d in lines if not d.endswith(".qzz.io")]
+    return random.choice(candidates) if candidates else None
+
+
+def yyds_create_mailbox(prefix: str = "qoder", task_id: str | None = None, domain: str | None = None) -> str:
     key = _yyds_key()
     if not key:
         raise RuntimeError(
             "YYDS_API_KEY 未配置：请在项目根 .env 或系统环境变量中设置 YYDS_API_KEY（AC- 开头），然后重启服务"
         )
     local = prefix + uuid.uuid4().hex[:8]
-    r = httpx.post(
-        f"{YYDS_API}/accounts",
-        headers={"X-API-Key": key, "Content-Type": "application/json"},
-        json={"localPart": local},
-        timeout=20,
-    )
-    r.raise_for_status()
-    address = r.json()["data"]["address"]
-    _log(task_id, f"[mail] created {address}")
-    return address
+    # 部分"干净"域会拒建箱（如抽样出现 403），自动换域重试，最多 3 次
+    last_err: Exception | None = None
+    for attempt in range(3):
+        chosen = domain or _pick_yyds_domain()
+        payload = {"localPart": local}
+        if chosen:
+            payload["domain"] = chosen
+        r = httpx.post(
+            f"{_yyds_api()}/accounts",
+            headers={"X-API-Key": key, "Content-Type": "application/json"},
+            json=payload,
+            timeout=20,
+        )
+        if r.status_code in (200, 201):
+            address = r.json()["data"]["address"]
+            _log(task_id, f"[mail] created {address} (domain={chosen or 'auto'})")
+            return address
+        last_err = RuntimeError(f"accounts create status {r.status_code}: {r.text[:200]}")
+        if r.status_code != 403 or not chosen:
+            break
+        _log(task_id, f"[mail] domain {chosen} refused (403), retry #{attempt + 1}...")
+    raise last_err or RuntimeError("accounts create failed")
 
 
 re_digit = re.compile(r"(?<!\d)(\d{6})(?!\d)")
@@ -194,7 +251,7 @@ def yyds_wait_code(address: str, task_id: str | None = None, timeout: float = 12
     while time.time() < deadline:
         try:
             r = httpx.get(
-                f"{YYDS_API}/messages/next",
+                f"{_yyds_api()}/messages/next",
                 params={"address": address, "wait": 30},
                 headers={"X-API-Key": key},
                 timeout=45,
@@ -445,7 +502,11 @@ class RegistrarBot:
     def register(self) -> dict:
         page = self.page
         tid = self.task_id
-        address = yyds_create_mailbox(task_id=tid)
+        address = _mail_create(
+            task_id=tid,
+            log=_log,
+            yyds_fallback=lambda: yyds_create_mailbox(task_id=tid),
+        )
         first, last = _random_name()
         password = _random_password()
         _log(tid, f"[reg] name={first} {last}  mail={address}")
@@ -501,7 +562,14 @@ class RegistrarBot:
             _log(tid, "[verify] slider done, focus released")
 
         _set_task(tid, "waiting_otp")
-        code = yyds_wait_code(address, task_id=tid, timeout=120)
+        code = _mail_wait(
+            address,
+            task_id=tid,
+            timeout=300,
+            since=time.time(),
+            log=_log,
+            yyds_fallback=lambda: yyds_wait_code(address, task_id=tid, timeout=300),
+        )
 
         otp_inputs = page.eles('css:input[aria-label^="OTP Input"]')
         if otp_inputs:

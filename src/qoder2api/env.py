@@ -3,18 +3,28 @@ from pathlib import Path
 
 
 def load_dotenv() -> None:
-    env_path = Path.cwd() / ".env"
-    if not env_path.exists():
-        return
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+    candidates = [
+        Path.cwd() / ".env",
+        Path(__file__).resolve().parent.parent.parent / ".env",  # 项目根
+    ]
+    seen: set[Path] = set()
+    for env_path in candidates:
+        try:
+            env_path = env_path.resolve()
+        except Exception:
             continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
+        if env_path in seen or not env_path.exists():
+            continue
+        seen.add(env_path)
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
 
 
 load_dotenv()

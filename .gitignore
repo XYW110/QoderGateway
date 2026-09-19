@@ -11,6 +11,9 @@ frontend/dist/
 src/qoder2api/static/
 *.db
 
+# 注册机邮件原文转储（含验证码正文，勿提交）
+logs/
+
 # scripts 凭据与临时产物（含真实 token/密码，勿提交）
 scripts/qoder_credentials.json
 scripts/*_result.json

@@ -32,6 +32,11 @@ from pathlib import Path
 
 import httpx
 
+_SRC = Path(__file__).resolve().parent.parent / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+from qoder2api.mail_backend import create_mailbox as _mail_create, wait_code as _mail_wait  # noqa: E402
+
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -46,7 +51,7 @@ from qoder_button_parser import pick_button  # noqa: E402
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
-YYDS_API = "https://maliapi.215.im/v1"
+YYDS_API = "https://vip.215.im/v1"  # 默认基址；如需换域名，用 YYDS_API_BASE 覆盖（旧域名 maliapi.215.im 已失效）
 YYDS_KEY = os.getenv("YYDS_API_KEY", "AC-62b8a8a286e8e898e8cc1e63")
 REGISTER_URL = "https://qoder.com/users/sign-up"
 LOGIN_URL = "https://qoder.com/users/sign-in"
@@ -58,6 +63,27 @@ OUT_CREDENTIALS = Path(__file__).resolve().parent / "qoder_credentials.json"
 LAST_PROFILE = Path(__file__).resolve().parent / ".last_profile"
 
 log = print
+
+
+def _yyds_api() -> str:
+    """动态读取 YYDS 邮箱 API 基址：环境变量 YYDS_API_BASE 优先，其次项目根 .env，最后回落到默认值。
+    不模块级固化：该服务域名曾从 maliapi.215.im 迁移到 vip.215.im。"""
+    base = (os.getenv("YYDS_API_BASE") or "").strip()
+    if base:
+        return base.rstrip("/")
+    try:
+        env_path = Path(__file__).resolve().parent.parent / ".env"  # 项目根
+        if env_path.exists():
+            for raw in env_path.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if line.startswith("YYDS_API_BASE="):
+                    base = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if base:
+                        os.environ.setdefault("YYDS_API_BASE", base)
+                        return base.rstrip("/")
+    except Exception:
+        pass
+    return YYDS_API
 
 
 # ---------------------------------------------------------------------------
@@ -93,19 +119,51 @@ def random_password(length: int = 12) -> str:
 # ---------------------------------------------------------------------------
 # YYDS Mail 集成
 # ---------------------------------------------------------------------------
-def yyds_create_mailbox(prefix: str = "qoder") -> str:
-    """创建临时邮箱，返回 address。"""
+def _pick_yyds_domain() -> str | None:
+    """从项目根 yyds_clean_domains.txt 随机挑一个"非 qzz.io"干净域。
+
+    qzz.io 系列域名被 qoder 判定为临时域、拒收验证码，必须显式避开；
+    domain 参数缺省时用它建箱，避免 YYDS API 随机选域（含 qzz.io 风险）。
+    文件缺失或池为空时返回 None（由 YYDS API 兜底随机选域）。
+    """
+    clean_file = Path(__file__).resolve().parent.parent / "yyds_clean_domains.txt"
+    try:
+        lines = [
+            ln.strip()
+            for ln in clean_file.read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+    except Exception:
+        return None
+    candidates = [d for d in lines if not d.endswith(".qzz.io")]
+    return random.choice(candidates) if candidates else None
+
+
+def yyds_create_mailbox(prefix: str = "qoder", domain: str | None = None) -> str:
+    """创建临时邮箱，返回 address。domain 缺省时从 clean 域池随机指定干净域。"""
     local = prefix + uuid.uuid4().hex[:8]
-    r = httpx.post(
-        f"{YYDS_API}/accounts",
-        headers={"X-API-Key": YYDS_KEY, "Content-Type": "application/json"},
-        json={"localPart": local},
-        timeout=20,
-    )
-    r.raise_for_status()
-    data = r.json()["data"]
-    log(f"[mail] created {data['address']} (expires {data['expiresAt']})")
-    return data["address"]
+    # 部分"干净"域会拒建箱（如抽样出现 403），自动换域重试，最多 3 次
+    last_err: Exception | None = None
+    for attempt in range(3):
+        chosen = domain or _pick_yyds_domain()
+        payload = {"localPart": local}
+        if chosen:
+            payload["domain"] = chosen
+        r = httpx.post(
+            f"{_yyds_api()}/accounts",
+            headers={"X-API-Key": YYDS_KEY, "Content-Type": "application/json"},
+            json=payload,
+            timeout=20,
+        )
+        if r.status_code in (200, 201):
+            data = r.json()["data"]
+            log(f"[mail] created {data['address']} (expires {data['expiresAt']} domain={chosen or 'auto'})")
+            return data["address"]
+        last_err = RuntimeError(f"accounts create status {r.status_code}: {r.text[:200]}")
+        if r.status_code != 403 or not chosen:
+            break
+        log(f"[mail] domain {chosen} refused (403), retry #{attempt + 1}...")
+    raise last_err or RuntimeError("accounts create failed")
 
 
 def _extract_code(msg: dict) -> str | None:
@@ -124,7 +182,7 @@ def yyds_wait_code(address: str, timeout: float = 120.0) -> str:
     while time.time() < deadline:
         try:
             r = httpx.get(
-                f"{YYDS_API}/messages/next",
+                f"{_yyds_api()}/messages/next",
                 params={"address": address, "wait": 30},
                 headers={"X-API-Key": YYDS_KEY},
                 timeout=45,
@@ -284,7 +342,11 @@ class QoderRegistrar:
     def register(self) -> dict:
         page = self.page
         # 0) 先申请临时邮箱（提前拿到地址）
-        address = yyds_create_mailbox()
+        address = _mail_create(
+            task_id=None,
+            log=lambda _tid, msg: log(msg),
+            yyds_fallback=yyds_create_mailbox,
+        )
         first, last = random_name()
         password = random_password()
         log(f"[reg] name={first} {last}  mail={address}  pwd={password}")
@@ -333,7 +395,14 @@ class QoderRegistrar:
             log("[reg] page jumped directly to download")
 
         # 7) 反复检查收件箱提取验证码（邮件一般 10s 内到达）
-        code = yyds_wait_code(address, timeout=120)
+        code = _mail_wait(
+            address,
+            task_id=None,
+            timeout=300,
+            since=time.time(),
+            log=lambda _tid, msg: log(msg),
+            yyds_fallback=lambda: yyds_wait_code(address, timeout=300),
+        )
 
         # 8) 填入 OTP
         otp_inputs = page.eles('css:input[aria-label^="OTP Input"]')

@@ -32,11 +32,12 @@ import httpx
 from .accounts import db_get_settings, db_set_settings
 from .database import get_db
 from .env import httpx_client_kwargs, load_dotenv
+from .mail_backend import create_mailbox as _mail_create, wait_code as _mail_wait
 
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
-YYDS_API = "https://maliapi.215.im/v1"
+YYDS_API = "https://vip.215.im/v1"  # 默认基址；如需换域名，用 YYDS_API_BASE 覆盖（旧域名 maliapi.215.im 已失效）
 REGISTER_URL = "https://qoder.com/users/sign-up"
 SUCCESS_URL_MARK = "/download"
 DEVICE_CLIENT_ID = "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb"
@@ -157,23 +158,76 @@ def _yyds_key() -> str | None:
     return None
 
 
-def yyds_create_mailbox(prefix: str = "qoder", task_id: str | None = None) -> str:
+def _yyds_api() -> str:
+    """动态读取 YYDS 邮箱 API 基址：环境变量 YYDS_API_BASE 优先，其次项目根 .env，最后回落到默认值。
+    不模块级固化：该服务域名曾从 maliapi.215.im 迁移到 vip.215.im。"""
+    base = (os.getenv("YYDS_API_BASE") or "").strip()
+    if base:
+        return base.rstrip("/")
+    try:
+        env_path = Path(__file__).resolve().parent.parent.parent / ".env"  # 项目根
+        if env_path.exists():
+            for raw in env_path.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if line.startswith("YYDS_API_BASE="):
+                    base = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if base:
+                        os.environ.setdefault("YYDS_API_BASE", base)
+                        return base.rstrip("/")
+    except Exception:
+        pass
+    return YYDS_API
+
+
+def _pick_yyds_domain() -> str | None:
+    """从项目根 yyds_clean_domains.txt 随机挑一个"非 qzz.io"干净域。
+
+    qzz.io 系列域名被 qoder 判定为临时域、拒收验证码，必须显式避开；
+    domain 参数缺省时用它建箱，避免 YYDS API 随机选域（含 qzz.io 风险）。
+    文件缺失或池为空时返回 None（由 YYDS API 兜底随机选域）。
+    """
+    clean_file = Path(__file__).resolve().parent.parent.parent / "yyds_clean_domains.txt"
+    try:
+        lines = [
+            ln.strip()
+            for ln in clean_file.read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+    except Exception:
+        return None
+    candidates = [d for d in lines if not d.endswith(".qzz.io")]
+    return random.choice(candidates) if candidates else None
+
+
+def yyds_create_mailbox(prefix: str = "qoder", task_id: str | None = None, domain: str | None = None) -> str:
     key = _yyds_key()
     if not key:
         raise RuntimeError(
             "YYDS_API_KEY 未配置：请在项目根 .env 或系统环境变量中设置 YYDS_API_KEY（AC- 开头），然后重启服务"
         )
     local = prefix + uuid.uuid4().hex[:8]
-    r = httpx.post(
-        f"{YYDS_API}/accounts",
-        headers={"X-API-Key": key, "Content-Type": "application/json"},
-        json={"localPart": local},
-        timeout=20,
-    )
-    r.raise_for_status()
-    address = r.json()["data"]["address"]
-    _log(task_id, f"[mail] created {address}")
-    return address
+    # 部分"干净"域会拒建箱（如抽样出现 403），自动换域重试，最多 3 次
+    last_err: Exception | None = None
+    for attempt in range(3):
+        chosen = domain or _pick_yyds_domain()
+        payload = {"localPart": local}
+        if chosen:
+            payload["domain"] = chosen
+        r = httpx.post(
+            f"{_yyds_api()}/accounts",
+            headers={"X-API-Key": key, "Content-Type": "application/json"},
+            json=payload,
+            timeout=20,
+        )
+        if r.status_code in (200, 201):
+            address = r.json()["data"]["address"]
+            _log(task_id, f"[mail] created {address} (domain={chosen or 'auto'})")
+            return address
+        last_err = RuntimeError(f"accounts create status {r.status_code}: {r.text[:200]}")
+        if r.status_code != 403 or not chosen:
+            break
+        _log(task_id, f"[mail] domain {chosen} refused (403), retry #{attempt + 1}...")
+    raise last_err or RuntimeError("accounts create failed")
 
 
 re_digit = re.compile(r"(?<!\d)(\d{6})(?!\d)")
@@ -196,7 +250,7 @@ def yyds_wait_code(address: str, task_id: str | None = None, timeout: float = 12
     while time.time() < deadline:
         try:
             r = httpx.get(
-                f"{YYDS_API}/messages/next",
+                f"{_yyds_api()}/messages/next",
                 params={"address": address, "wait": 30},
                 headers={"X-API-Key": key},
                 timeout=45,
@@ -331,33 +385,75 @@ class RegistrarBot:
             _log(self.task_id, f"[browser] hide error: {e}")
 
     def window_show_top(self) -> None:
+        """显示并可靠置顶本任务窗口（人工划滑块用）。
+
+        后台服务进程直接调 SetForegroundWindow 会被 Windows 前台锁拒绝
+        （pywin32 抛 (0, 'SetForegroundWindow', 'No error message is available')），
+        故先把本线程输入队列 AttachThreadInput 到当前前景窗口线程再抢焦点。
+        无论成败都在 finally 里还原 HWND_NOTOPMOST，避免窗口残留置顶。
+        """
         try:
             self.page.set.window.show()
         except Exception:
             pass
+        hwnd: int | None = None
         try:
+            import win32api
             import win32con
             import win32gui
+            import win32process
+
             title = self.page.title or ""
             wins: list[int] = []
 
-            def _find(hwnd: int, acc: list[int]) -> bool:
-                if win32gui.IsWindowVisible(hwnd) and title and title in win32gui.GetWindowText(hwnd):
-                    acc.append(hwnd)
+            def _find(h: int, acc: list[int]) -> bool:
+                if win32gui.IsWindowVisible(h) and title and title in win32gui.GetWindowText(h):
+                    acc.append(h)
                 return True
 
             win32gui.EnumWindows(_find, wins)
-            if wins:
-                hwnd = wins[0]
-                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
-                                      win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
+            if not wins:
+                _log(self.task_id, "[browser] show_top: window not found (title mismatch?)")
+                return
+            hwnd = wins[0]
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            # 先 TOPMOST：即使抢前台失败，窗口也不会被其他窗口挡住
+            win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                                  win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
+
+            # 绕过前台锁：附加本线程输入队列到前景窗口线程后再抢前台
+            cur_tid = win32api.GetCurrentThreadId()
+            fg = win32gui.GetForegroundWindow()
+            fg_tid = win32process.GetWindowThreadProcessId(fg)[0] if fg else 0
+            attached = False
+            if fg_tid and fg_tid != cur_tid:
+                try:
+                    win32process.AttachThreadInput(cur_tid, fg_tid, True)
+                    attached = True
+                except Exception:
+                    pass
+            try:
+                win32gui.BringWindowToTop(hwnd)
                 win32gui.SetForegroundWindow(hwnd)
-                win32gui.SetWindowPos(hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
-                                      win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
-                _log(self.task_id, "[browser] window shown & top")
+            finally:
+                if attached:
+                    try:
+                        win32process.AttachThreadInput(cur_tid, fg_tid, False)
+                    except Exception:
+                        pass
+            _log(self.task_id, "[browser] window shown & top")
         except Exception as e:
             _log(self.task_id, f"[browser] show_top error: {e}")
+        finally:
+            # 无论成功或异常都必须还原 Z 序，否则窗口永久置顶
+            if hwnd:
+                try:
+                    import win32con
+                    import win32gui
+                    win32gui.SetWindowPos(hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
+                                          win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
+                except Exception:
+                    pass
 
     def close(self) -> None:
         try:
@@ -453,6 +549,59 @@ class RegistrarBot:
             _log(self.task_id, f"[fill] {selector} 值验证失败(尝试{attempt + 1}): 期望 {value!r} 实际 {got!r}，重试")
         raise RuntimeError(f"多次填表失败: {selector}")
 
+    # ---- OTP 输入框（兼容新版单框 / 旧版多框）----
+    # 实测：新版 OTP 页只有一个 <input autocomplete="one-time-code" maxlength="6">，
+    # 无 aria-label / id / name；旧版为多个 aria-label="OTP Input *" 小框，故保留作兜底。
+    _OTP_SELECTORS = (
+        'css:input[autocomplete="one-time-code"]',  # 新版单框（实测命中）
+        'css:input[aria-label^="OTP Input"]',       # 旧版多框
+        'css:input[maxlength="6"]',                 # 兜底
+    )
+
+    def _find_otp_inputs(self) -> list:
+        """返回当前页面可见的 OTP 输入框列表（按选择器优先级取首个命中的一组）。"""
+        for sel in self._OTP_SELECTORS:
+            try:
+                els = self.page.eles(sel)
+            except Exception:
+                els = None
+            if not els:
+                continue
+            vis = []
+            for el in els:
+                try:
+                    if el.states.is_displayed:
+                        vis.append(el)
+                except Exception:
+                    vis.append(el)
+            if vis:
+                return vis
+        return []
+
+    def _fill_otp(self, code: str) -> None:
+        """填写 OTP：新版单框整体填入；旧版多框逐字符填入。"""
+        inputs = self._find_otp_inputs()
+        if not inputs:
+            raise RuntimeError("找不到 OTP 输入框")
+        if len(inputs) == 1:
+            el = inputs[0]
+            try:
+                el.clear()
+            except Exception:
+                pass
+            el.input(code)
+            try:
+                got = el.value or ""
+            except Exception:
+                got = el.attr("value") or ""
+            if got != code:
+                _log(self.task_id, "[reg] OTP 单框值校验失败，改用 input(code, clear=True) 重试")
+                el.input(code, clear=True)
+        else:
+            for i, ch in enumerate(code[: len(inputs)]):
+                inputs[i].input(ch)
+        _log(self.task_id, f"[reg] OTP filled: {code}")
+
     # ---- 打开页面且全程隐藏（仅人机验证时 show_top 显示） ----
     def _open_hidden(self, url: str) -> None:
         self.window_hide()  # get 前尽量隐藏（窗口刚建立即可）
@@ -467,7 +616,11 @@ class RegistrarBot:
     def register(self) -> dict:
         page = self.page
         tid = self.task_id
-        address = yyds_create_mailbox(task_id=tid)
+        address = _mail_create(
+            task_id=tid,
+            log=_log,
+            yyds_fallback=lambda: yyds_create_mailbox(task_id=tid),
+        )
         first, last = _random_name()
         password = _random_password()
         _log(tid, f"[reg] name={first} {last}  mail={address}")
@@ -503,35 +656,43 @@ class RegistrarBot:
             while time.time() < otp_deadline:
                 if _REGISTRAR["stop_requested"]:
                     raise RuntimeError("用户请求停止注册")
+                if SUCCESS_URL_MARK in page.url:
+                    break  # 直接跳转，无需 OTP
                 try:
-                    if page.ele('css:input[aria-label^="OTP Input"]', timeout=2):
+                    if self._find_otp_inputs():
                         otp_seen = True
                         break
                 except Exception:
                     pass
-                if SUCCESS_URL_MARK in page.url:
-                    otp_seen = False  # 直接跳转，无需 OTP
-                    break
                 time.sleep(0.5)
             if otp_seen:
                 _log(tid, "[reg] OTP input appeared")
-            else:
+            elif SUCCESS_URL_MARK in page.url:
                 _log(tid, "[reg] page jumped directly to download (no OTP)")
+            else:
+                _log(tid, "[reg] 等待 OTP 超时（300s），继续后续流程")
         finally:
             self.window_hide()
             self.vq.release(tid)
             _log(tid, "[verify] slider done, focus released")
 
-        _set_task(tid, "waiting_otp")
-        code = yyds_wait_code(address, task_id=tid, timeout=120)
+        # 无需 OTP：页面已直接跳到下载页 → 注册已成功
+        if SUCCESS_URL_MARK in page.url:
+            _log(tid, f"[reg] SUCCESS -> {page.url}")
+            return {"email": address, "password": password, "name": f"{first} {last}"}
 
-        otp_inputs = page.eles('css:input[aria-label^="OTP Input"]')
-        if otp_inputs:
-            for i, ch in enumerate(code[: len(otp_inputs)]):
-                otp_inputs[i].input(ch)
-            _log(tid, f"[reg] OTP filled: {code}")
-        else:
-            self._locate('css:input[aria-label^="OTP Input"]', desc="OTP 输入框").input(code)
+        _set_task(tid, "waiting_otp")
+        # since=OTP 页出现时刻（滑块通过后 qoder 才发信）；共享收件箱必须按发码时刻过滤
+        code = _mail_wait(
+            address,
+            task_id=tid,
+            timeout=300,
+            since=time.time(),
+            log=_log,
+            yyds_fallback=lambda: yyds_wait_code(address, task_id=tid, timeout=300),
+        )
+
+        self._fill_otp(code)
 
         deadline = time.time() + 30
         while time.time() < deadline:
@@ -759,7 +920,11 @@ def _save_account(task_id: str, acct: dict, cred: dict) -> str:
                 enabled, cred.get("expires_at") or "",
             ),
         )
-        if not db_get_settings("active_uid"):
-            db_set_settings("active_uid", uid)
+        active = conn.execute("SELECT value FROM settings WHERE key = 'active_uid'").fetchone()
+        if not (active and active[0]):
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('active_uid', ?)",
+                (uid,),
+            )
     _log(task_id, f"[registrar] account saved to DB: {uid} ({acct.get('email')})")
     return uid
