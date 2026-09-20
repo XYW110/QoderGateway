@@ -1,11 +1,19 @@
 import os
+import sys
 from pathlib import Path
+
+
+def project_root() -> Path:
+    """运行时根目录：冻结(exe)时为 exe 所在目录，源码运行为项目根。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent.parent
 
 
 def load_dotenv() -> None:
     candidates = [
         Path.cwd() / ".env",
-        Path(__file__).resolve().parent.parent.parent / ".env",  # 项目根
+        project_root() / ".env",
     ]
     seen: set[Path] = set()
     for env_path in candidates:

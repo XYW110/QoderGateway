@@ -2,6 +2,7 @@ import argparse
 import collections
 import json
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -46,7 +47,10 @@ from .tokens import (
     start_refresh_loop,
 )
 
-BASE_DIR = os.path.dirname(__file__)
+if getattr(sys, "frozen", False):  # PyInstaller 单文件：资源解压到 _MEIPASS
+    BASE_DIR = str(Path(sys._MEIPASS) / "qoder2api")
+else:
+    BASE_DIR = os.path.dirname(__file__)
 INDEX_HTML = Path(BASE_DIR) / "static" / "index.html"
 CONSOLE_HTML = Path(BASE_DIR) / "static" / "console.html"
 DOCS_HTML = Path(BASE_DIR) / "static" / "docs.html"
@@ -600,7 +604,13 @@ def main() -> None:
     parser.add_argument("--host", default=os.getenv("QODER_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.getenv("QODER_PORT", "5050")))
     args = parser.parse_args()
-    uvicorn.run("qoder2api.app:app", host=args.host, port=args.port, reload=False)
+    kwargs = {}
+    if getattr(sys, "frozen", False):
+        # 无控制台打包：sys.stdout 可能为 None，uvicorn 默认 dictConfig 的
+        # 彩色 Formatter 会调 sys.stdout.isatty() 崩溃，禁用其日志配置。
+        kwargs["log_config"] = None
+        kwargs["log_level"] = "info"
+    uvicorn.run(app, host=args.host, port=args.port, reload=False, **kwargs)
 
 if __name__ == "__main__":
     main()

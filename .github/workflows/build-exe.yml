@@ -1,0 +1,49 @@
+name: Build Windows EXE
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: 构建前端静态资源
+        working-directory: frontend
+        run: |
+          npm install
+          npm run build
+
+      - name: 安装 Python 依赖
+        run: |
+          pip install .
+          pip install pyinstaller
+
+      - name: PyInstaller 打包
+        run: pyinstaller --clean -y qodergateway.spec
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: QoderGateway-exe
+          path: dist/QoderGateway.exe
+
+      - name: 附加到 GitHub Release（仅 tag 触发）
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/QoderGateway.exe

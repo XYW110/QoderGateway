@@ -20,8 +20,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-_CHANNEL_MAIL = Path(__file__).resolve().parent.parent.parent / "temp" / "channel_mail"
-_MAIL_LOG_DIR = Path(__file__).resolve().parent.parent.parent / "logs" / "mail"
+from .env import project_root
+
+_CHANNEL_MAIL = project_root() / "temp" / "channel_mail"
+_MAIL_LOG_DIR = project_root() / "logs" / "mail"
 
 # qoder 验证码邮件特征（发件人 / 主题 / 正文任一命中即认）
 _QODER_HINTS = (

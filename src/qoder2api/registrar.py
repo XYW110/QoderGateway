@@ -31,7 +31,7 @@ import httpx
 
 from .accounts import db_get_settings, db_set_settings
 from .database import get_db
-from .env import httpx_client_kwargs, load_dotenv
+from .env import httpx_client_kwargs, load_dotenv, project_root
 from .mail_backend import create_mailbox as _mail_create, wait_code as _mail_wait
 
 # ---------------------------------------------------------------------------
@@ -144,7 +144,7 @@ def _yyds_key() -> str | None:
     if key:
         return key
     try:
-        env_path = Path(__file__).resolve().parent.parent.parent / ".env"  # 项目根
+        env_path = project_root() / ".env"  # 运行时根目录
         if env_path.exists():
             for raw in env_path.read_text(encoding="utf-8").splitlines():
                 line = raw.strip()
@@ -165,7 +165,7 @@ def _yyds_api() -> str:
     if base:
         return base.rstrip("/")
     try:
-        env_path = Path(__file__).resolve().parent.parent.parent / ".env"  # 项目根
+        env_path = project_root() / ".env"  # 运行时根目录
         if env_path.exists():
             for raw in env_path.read_text(encoding="utf-8").splitlines():
                 line = raw.strip()
@@ -186,7 +186,7 @@ def _pick_yyds_domain() -> str | None:
     domain 参数缺省时用它建箱，避免 YYDS API 随机选域（含 qzz.io 风险）。
     文件缺失或池为空时返回 None（由 YYDS API 兜底随机选域）。
     """
-    clean_file = Path(__file__).resolve().parent.parent.parent / "yyds_clean_domains.txt"
+    clean_file = project_root() / "yyds_clean_domains.txt"
     try:
         lines = [
             ln.strip()
@@ -651,8 +651,7 @@ class RegistrarBot:
         auto_ok = False
         auto_on = os.environ.get("QODER_SLIDER_AUTO", "1").strip().lower() not in (
             "0", "false", "no", "off")
-        dump_root = (Path(__file__).resolve().parents[2] / "logs" / "slider"
-                     / (tid or "task")[:8])
+        dump_root = project_root() / "logs" / "slider" / (tid or "task")[:8]
         if auto_on:
             try:
                 from .slider import solve as _slider_solve
