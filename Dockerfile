@@ -16,8 +16,10 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 RUN pip install --no-cache-dir .
 
-# 前端静态资源
-COPY --from=frontend /build/src/qoder2api/static ./src/qoder2api/static
+# 前端静态资源（vite outDir 相对 /build 解析为 /src/qoder2api/static）
+COPY --from=frontend /src/qoder2api/static ./src/qoder2api/static
+# 运行时 BASE_DIR 指向 site-packages 里的包目录，把静态资源拷过去
+RUN cp -r src/qoder2api/static "$(python -c "import qoder2api, os; print(os.path.dirname(qoder2api.__file__))")/"
 
 # 可写目录（SQLite 数据库、日志）
 ENV QODER_HOST=0.0.0.0 \
