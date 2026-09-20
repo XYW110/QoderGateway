@@ -645,11 +645,61 @@ class RegistrarBot:
         self._click_submit()
         _log(tid, "[reg] submitted password step")
 
-        # 人机验证：排队 + 置顶显示一次，划完自动隐藏（轮询等待，可被 stop 中断）
+        # ---------------- 人机验证：优先自动求解滑块，失败回落人工 ----------------
         _set_task(tid, "waiting_slider")
-        self.vq.acquire(tid)
-        self.window_show_top()
-        _log(tid, ">>> 请在本机浏览器完成人机验证（窗口已置顶）<<<")
+        acquired = False
+        auto_ok = False
+        auto_on = os.environ.get("QODER_SLIDER_AUTO", "1").strip().lower() not in (
+            "0", "false", "no", "off")
+        dump_root = (Path(__file__).resolve().parents[2] / "logs" / "slider"
+                     / (tid or "task")[:8])
+        if auto_on:
+            try:
+                from .slider import solve as _slider_solve
+            except Exception as e:  # noqa: BLE001
+                _log(tid, f"[slider] import failed: {type(e).__name__} {e}")
+                _slider_solve = None
+            if _slider_solve:
+                # 阶段1：窗口保持最小化（不打扰用户）先试；
+                # 阶段2：若疑似被渲染节流（挂载失败/拼图不动）→ 置顶后再试。
+                for phase in ("hidden", "visible"):
+                    if _REGISTRAR["stop_requested"]:
+                        raise RuntimeError("用户请求停止注册")
+                    if phase == "visible":
+                        self.window_show_top()
+                    try:
+                        _res = _slider_solve(
+                            page,
+                            dump_dir=str(dump_root / phase),
+                            rounds=1 if phase == "hidden" else 3,
+                            open_timeout=25.0 if phase == "hidden" else 45.0,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        _res = {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+                    _last = (_res.get("log") or [{}])[-1]
+                    _judge = (_res.get("judge") or (_last.get("judge") or {}))
+                    _err = _last.get("error")
+                    _log(tid, "[slider] %s auto: ok=%s reason=%s round=%s gap=%s err=%s "
+                              "drag=%s judge=%s weak=%s" % (
+                                  phase, _res.get("ok"), _res.get("reason"), _res.get("round"),
+                                  (_res.get("gap") or _last.get("gap") or {}).get("gap_x"),
+                                  _err, _res.get("drag") or _last.get("drag"),
+                                  {k: _judge.get(k) for k in
+                                   ("pass", "reason", "startText", "cls", "text", "popup_w")},
+                                  _res.get("weak")))
+                    if _res.get("ok"):
+                        auto_ok = True
+                        break
+                    if phase == "hidden":
+                        self.window_hide()
+        if auto_ok:
+            self.window_hide()
+            _log(tid, "[slider] 自动求解通过 ✔")
+        else:
+            self.vq.acquire(tid)
+            acquired = True
+            self.window_show_top()
+            _log(tid, ">>> 自动求解未通过，请人工完成人机验证（窗口已置顶）<<<")
         try:
             otp_deadline = time.time() + 300
             otp_seen = False
@@ -673,8 +723,9 @@ class RegistrarBot:
                 _log(tid, "[reg] 等待 OTP 超时（300s），继续后续流程")
         finally:
             self.window_hide()
-            self.vq.release(tid)
-            _log(tid, "[verify] slider done, focus released")
+            if acquired:
+                self.vq.release(tid)
+            _log(tid, "[verify] slider phase done, focus released")
 
         # 无需 OTP：页面已直接跳到下载页 → 注册已成功
         if SUCCESS_URL_MARK in page.url:
