@@ -16,6 +16,19 @@ interface Account {
 interface AccountsConfig { accounts: Account[]; active_uid: string | null }
 interface UIStatus { ready: boolean; mode: string; username: string | null; uid: string | null; user_type: string | null; error: string | null; accounts_count: number }
 interface APIConfig { auth_required: boolean; allowed_keys: string[] }
+
+/** 网关 API Key：名称 / 路由策略 / 限流上限（0=不限）+ 实时用量 */
+interface ApiKeyEntry {
+  api_key: string
+  name: string
+  strategy: number            // 1=填充（同 Key+模型固定账号） 2=轮询（每次请求依次换）
+  rpm_limit: number           // 每分钟请求上限，0=不限
+  concurrency_limit: number   // 并发上限，0=不限
+  enabled: number
+  created_at: string
+  rpm_used?: number
+  inflight?: number
+}
 interface Message { role: 'user' | 'assistant'; content: string }
 type TabId = 'dashboard' | 'accounts' | 'playground' | 'api-keys' | 'logs' | 'register'
 type AppTabId = TabId
@@ -67,7 +80,7 @@ const UI_TEXT = {
     },
     accounts: { desc: 'Manage Qoder accounts used by the gateway for request routing and failover.', refreshStatus: 'Refresh Status', importAccounts: 'Import Accounts', search: 'Search accounts...', empty: 'No accounts imported. Click Import Accounts or add a PAT from Dashboard.', showing: 'Showing {count} account(s)' },
     playground: { modelConfig: 'Model Configuration', streamResponse: 'Stream Response', systemPrompt: 'System Prompt', systemPromptPlaceholder: "Define the AI's persona...", ask: 'Ask anything...', send: 'Send', waiting: 'Waiting for response...' },
-    api: { generate: 'Generate New Key', desc: 'Manage authentication keys and gateway access permissions for client requests.', gatewayAuth: 'Gateway Authentication', gatewayAuthDesc: 'Toggle API key validation for incoming /v1 requests.', systemStatus: 'System Status', activeKeys: 'Active Keys', configured: 'configured', activeAccessKeys: 'Active Access Keys', keyPlaceholder: 'Enter or paste a key...', noKeys: 'No API keys configured. Generate one above.', bestPractices: 'Security Best Practices', bestPracticesDesc: 'Do not expose API keys in client-side code. Rotate keys when they appear in logs, screenshots, or shared scripts.', securityPolicy: 'Security Policy' },
+    api: { generate: 'Generate New Key', desc: 'Manage authentication keys and gateway access permissions for client requests.', gatewayAuth: 'Gateway Authentication', gatewayAuthDesc: 'Toggle API key validation for incoming /v1 requests.', systemStatus: 'System Status', activeKeys: 'Active Keys', configured: 'configured', activeAccessKeys: 'Active Access Keys', keyPlaceholder: 'Enter or paste a key...', noKeys: 'No API keys configured. Generate one above.', namePlaceholder: 'Name (optional)...', strategyFill: 'Strategy 1 · Fill — same Key + model always uses one account', strategyRoundRobin: 'Strategy 2 · Round-robin — rotate account every request', strategyFillShort: 'Fill', strategyRoundRobinShort: 'Round-robin', rpmPlaceholder: 'RPM cap', concPlaceholder: 'Concurrency cap', limitHint: 'Limits: 0 = unlimited. Over-limit requests receive HTTP 429. Saved values apply immediately.', refresh: 'Refresh', generateShort: 'Random', labelRpm: 'RPM', labelConc: 'Conc', unlimited: '∞', colName: 'Name', colKey: 'API Key', colStrategy: 'Routing', colUsage: 'Limits / Live', colStatus: 'Status', colActions: 'Actions', bestPractices: 'Security Best Practices', bestPracticesDesc: 'Do not expose API keys in client-side code. Rotate keys when they appear in logs, screenshots, or shared scripts.', securityPolicy: 'Security Policy' },
     logs: { account: 'Account', status: 'Status', range: 'Range', allAccounts: 'All Accounts', allStatuses: 'All Statuses', last24h: 'Last 24h', lastHour: 'Last hour', last7d: 'Last 7 days', noLogs: 'No logs available', noMatch: 'No logs match current filters', timestamp: 'Timestamp', level: 'Level', message: 'Message' },
     register: {
       desc: 'Register multiple Qoder accounts in parallel, pull device credentials and auto-save them into the pool. Browsers stay hidden in the background; each task pops to top once for human verification, then hides again — finish one, next takes its turn.',
@@ -115,7 +128,7 @@ const UI_TEXT = {
     },
     accounts: { desc: '管理网关用于请求路由和失败切换的 Qoder 账号。', refreshStatus: '刷新状态', importAccounts: '导入账号', search: '搜索账号...', empty: '还没有导入账号。点击导入账号，或在控制台添加 PAT。', showing: '共 {count} 个账号' },
     playground: { modelConfig: '模型配置', streamResponse: '流式响应', systemPrompt: '系统提示词', systemPromptPlaceholder: '定义模型的角色或行为...', ask: '输入要发送的内容...', send: '发送', waiting: '正在等待响应...' },
-    api: { generate: '生成新 Key', desc: '管理客户端请求网关时使用的 API Key 和访问权限。', gatewayAuth: '网关 API 鉴权', gatewayAuthDesc: '控制 /v1 请求是否必须携带 API Key。', systemStatus: '系统状态', activeKeys: '可用 Key', configured: '已配置', activeAccessKeys: '已启用的 API Key', keyPlaceholder: '输入或粘贴 API Key...', noKeys: '还没有配置 API Key。请先生成并添加。', bestPractices: '安全建议', bestPracticesDesc: '不要把 API Key 写在前端代码里。如果 Key 出现在日志、截图或共享脚本中，请及时删除并重新生成。', securityPolicy: '安全策略' },
+    api: { generate: '生成新 Key', desc: '管理客户端请求网关时使用的 API Key 和访问权限。', gatewayAuth: '网关 API 鉴权', gatewayAuthDesc: '控制 /v1 请求是否必须携带 API Key。', systemStatus: '系统状态', activeKeys: '可用 Key', configured: '已配置', activeAccessKeys: '已启用的 API Key', keyPlaceholder: '输入或粘贴 API Key...', noKeys: '还没有配置 API Key。请先生成并添加。', namePlaceholder: '名称（可留空）...', strategyFill: '策略1 · 填充：同一 Key + 模型固定使用同一账号', strategyRoundRobin: '策略2 · 轮询：每次请求依次换下一个账号', strategyFillShort: '填充', strategyRoundRobinShort: '轮询', rpmPlaceholder: 'RPM 上限', concPlaceholder: '并发上限', limitHint: '上限填 0 表示不限；超出限制的请求返回 429，保存后立即生效。', refresh: '刷新', generateShort: '随机生成', labelRpm: 'RPM', labelConc: '并发', unlimited: '∞', colName: '名称', colKey: 'API Key', colStrategy: '路由策略', colUsage: '上限 / 实时', colStatus: '状态', colActions: '操作', bestPractices: '安全建议', bestPracticesDesc: '不要把 API Key 写在前端代码里。如果 Key 出现在日志、截图或共享脚本中，请及时删除并重新生成。', securityPolicy: '安全策略' },
     logs: { account: '账号', status: '级别', range: '时间范围', allAccounts: '全部账号', allStatuses: '全部级别', last24h: '最近 24 小时', lastHour: '最近 1 小时', last7d: '最近 7 天', noLogs: '暂无日志', noMatch: '没有匹配当前筛选条件的日志', timestamp: '时间', level: '级别', message: '内容' },
     register: {
       desc: '并行注册多个 Qoder 账号并拉取 Device 凭据，成功后自动入库。浏览器平时隐藏后台，人机验证时置顶显示，划完一个自动轮到下一个。',
@@ -335,6 +348,12 @@ export default function App() {
 
   const [newKey, setNewKey] = useState('')
   const [copiedKey, setCopiedKey] = useState<string | null>(null)
+  const [apiKeys, setApiKeys] = useState<ApiKeyEntry[]>([])
+  const [keyName, setKeyName] = useState('')
+  const [keyStrategy, setKeyStrategy] = useState(1)
+  const [keyRpm, setKeyRpm] = useState('')
+  const [keyConc, setKeyConc] = useState('')
+  const [savingKey, setSavingKey] = useState(false)
   const [patToken, setPatToken] = useState('')
   const [submittingPat, setSubmittingPat] = useState(false)
   const [searchAccounts, setSearchAccounts] = useState('')
@@ -447,6 +466,9 @@ export default function App() {
   const fetchApiConfig = useCallback(async () => {
     try { const resp = await authedFetch('/ui/config'); const data = await resp.json(); setApiConfig(data) } catch { /* */ }
   }, [authedFetch])
+  const fetchApiKeys = useCallback(async () => {
+    try { const resp = await authedFetch('/ui/keys'); const data = await resp.json(); setApiKeys(data.keys || []) } catch { /* */ }
+  }, [authedFetch])
   const doBatchImport = useCallback(async () => {
     let records: unknown
     try { records = JSON.parse(batchJson) } catch { pushToast('ERROR', lang === 'zh' ? 'JSON 解析失败' : 'Invalid JSON', ''); return }
@@ -543,12 +565,13 @@ export default function App() {
 
   useEffect(() => {
     if (!token) return
-    fetchStatus(); fetchAccounts(); fetchApiConfig(); fetchLogs(); fetchRegStatus()
+      fetchStatus(); fetchAccounts(); fetchApiConfig(); fetchApiKeys(); fetchLogs(); fetchRegStatus()
     const si = setInterval(fetchStatus, 6000)
-    const li = setInterval(() => { if (activeTab === 'logs') fetchLogs() }, 3000)
-    const ri = setInterval(() => { if (activeTab === 'register' && regStatus?.running) fetchRegStatus() }, 2000)
-    return () => { clearInterval(si); clearInterval(li); clearInterval(ri) }
-  }, [token, activeTab, fetchStatus, fetchAccounts, fetchApiConfig, fetchLogs, fetchRegStatus, regStatus?.running])
+     const li = setInterval(() => { if (activeTab === 'logs') fetchLogs() }, 3000)
+     const ki = setInterval(() => { if (activeTab === 'api-keys') fetchApiKeys() }, 5000)
+     const ri = setInterval(() => { if (activeTab === 'register' && regStatus?.running) fetchRegStatus() }, 2000)
+     return () => { clearInterval(si); clearInterval(li); clearInterval(ki); clearInterval(ri) }
+   }, [token, activeTab, fetchStatus, fetchAccounts, fetchApiConfig, fetchApiKeys, fetchLogs, fetchRegStatus, regStatus?.running])
 
   useEffect(() => { if (activeTab === 'logs') logEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [logs, activeTab])
   useEffect(() => { if (activeTab === 'playground') chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [chatMessages, activeTab])
@@ -660,9 +683,11 @@ export default function App() {
     } catch (err: any) { pushToast('ERROR', msg.deleteFailed, err.message) }
   }
 
+  // 只提交 auth_required：allowed_keys 由专用接口维护，
+  // 避免旧的 string[] 语义把「已停用 Key」的名称/策略/限额连带清掉
   const handleSaveApiConfig = async (newConfig: APIConfig) => {
     try {
-      await authedFetch('/ui/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(newConfig) })
+      await authedFetch('/ui/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ auth_required: newConfig.auth_required }) })
       setApiConfig(newConfig)
     } catch { pushToast('ERROR', msg.configFailed, lang === 'zh' ? '无法更新 API 配置' : 'Could not update API configuration') }
   }
@@ -679,19 +704,55 @@ export default function App() {
     pushToast('INFO', lang === 'zh' ? 'Key 已生成' : 'Key Generated', msg.keyGenerated)
   }
 
-  const handleAddKey = () => {
-    const trimmed = newKey.trim()
-    if (!trimmed) return
-    if (apiConfig.allowed_keys.includes(trimmed)) { pushToast('ERROR', lang === 'zh' ? 'Key 已存在' : 'Duplicate Key', msg.duplicateKey); return }
-    handleSaveApiConfig({ ...apiConfig, allowed_keys: [...apiConfig.allowed_keys, trimmed] })
-    pushToast('SUCCESS', lang === 'zh' ? 'Key 已添加' : 'Key Added', msg.keyAdded)
-    setNewKey('')
+  /** 新增或更新一条 API Key（未传字段后端会保留旧值） */
+  const handleSaveKey = async (patch: Partial<ApiKeyEntry> & { api_key: string }): Promise<boolean> => {
+    setSavingKey(true)
+    try {
+      const resp = await authedFetch('/ui/keys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) })
+      if (!resp.ok) {
+        const detail = await resp.json().catch(() => ({} as { detail?: string }))
+        throw new Error(detail.detail || `HTTP ${resp.status}`)
+      }
+      await fetchApiKeys()
+      return true
+    } catch (err) { pushToast('ERROR', lang === 'zh' ? 'API Key 保存失败' : 'Failed to save API Key', (err as Error).message); return false }
+    finally { setSavingKey(false) }
   }
 
-  const handleDeleteKey = (key: string) => {
-    handleSaveApiConfig({ ...apiConfig, allowed_keys: apiConfig.allowed_keys.filter(k => k !== key) })
-    pushToast('SUCCESS', lang === 'zh' ? 'Key 已删除' : 'Key Removed', msg.keyRemoved)
+  const handleAddKey = async () => {
+    const trimmed = newKey.trim()
+    if (!trimmed) return
+    if (apiKeys.some(k => k.api_key === trimmed)) { pushToast('ERROR', lang === 'zh' ? 'Key 已存在' : 'Duplicate Key', msg.duplicateKey); return }
+    const ok = await handleSaveKey({
+      api_key: trimmed,
+      name: keyName.trim(),
+      strategy: keyStrategy,
+      rpm_limit: Math.max(0, Number(keyRpm) || 0),
+      concurrency_limit: Math.max(0, Number(keyConc) || 0),
+      enabled: 1,
+    })
+    if (ok) {
+      pushToast('SUCCESS', lang === 'zh' ? 'Key 已添加' : 'Key Added', msg.keyAdded)
+      setNewKey(''); setKeyName(''); setKeyRpm(''); setKeyConc(''); setKeyStrategy(1)
+    }
   }
+
+  const handleDeleteKey = async (key: string) => {
+    if (!confirm(lang === 'zh' ? `确认删除该 API Key？\n${key}` : `Delete this API Key?\n${key}`)) return
+    try {
+      const resp = await authedFetch(`/ui/keys/${encodeURIComponent(key)}`, { method: 'DELETE' })
+      if (!resp.ok && resp.status !== 404) throw new Error(`HTTP ${resp.status}`)
+      await fetchApiKeys()
+      pushToast('SUCCESS', lang === 'zh' ? 'Key 已删除' : 'Key Removed', msg.keyRemoved)
+    } catch (err) { pushToast('ERROR', msg.deleteFailed, (err as Error).message) }
+  }
+
+  const handleToggleKeyEnabled = async (entry: ApiKeyEntry) => {
+    await handleSaveKey({ api_key: entry.api_key, enabled: entry.enabled ? 0 : 1 })
+  }
+
+  /** Key 打码显示（明文可点复制按钮获取） */
+  const maskKey = (key: string) => (key.length <= 14 ? key : `${key.slice(0, 8)}…${key.slice(-4)}`)
 
   const handleCopyKey = (key: string) => {
     navigator.clipboard.writeText(key)
@@ -1178,9 +1239,9 @@ export default function App() {
                 </button>
               </div>
 
-              <div className="grid grid-cols-12 gap-8">
-                <div className="col-span-12 lg:col-span-4 flex flex-col gap-6">
-                  <div className="glass-card p-8 rounded-2xl flex flex-col justify-between min-h-[220px]">
+              <div className="space-y-6">
+                <div className="grid grid-cols-12 gap-6">
+                  <div className="col-span-12 lg:col-span-6 glass-card p-8 rounded-2xl flex flex-col justify-between min-h-[220px]">
                     <div><h3 className="font-bold text-ink text-lg mb-2">{t.api.gatewayAuth}</h3><p className="text-body text-sm">{t.api.gatewayAuthDesc}</p></div>
                     <div className="flex items-center justify-between pt-6 border-t border-hairline mt-auto">
                       <span className="text-[10px] font-bold text-body uppercase tracking-widest">{t.api.systemStatus}</span>
@@ -1189,32 +1250,76 @@ export default function App() {
                       </button>
                     </div>
                   </div>
-                  <div className="glass-card p-4 rounded-xl">
+                  <div className="col-span-6 lg:col-span-3 glass-card p-4 rounded-xl">
                     <span className="text-[10px] font-bold text-body uppercase tracking-widest">{t.api.activeKeys}</span>
-                    <div className="mt-2 flex items-baseline gap-2"><span className="font-display-sm text-ink">{apiConfig.allowed_keys.length}</span><span className="text-[10px] text-body font-bold">{t.api.configured}</span></div>
+                    <div className="mt-2 flex items-baseline gap-2"><span className="font-display-sm text-ink">{apiKeys.filter(k => k.enabled).length}</span><span className="text-[10px] text-body font-bold">/ {apiKeys.length} {t.api.configured}</span></div>
+                  </div>
+                  <div className="col-span-6 lg:col-span-3 glass-card p-4 rounded-xl">
+                    <span className="text-[10px] font-bold text-body uppercase tracking-widest">{t.api.colUsage}</span>
+                    <div className="mt-2 flex items-baseline gap-2"><span className="font-display-sm text-ink">{apiKeys.reduce((s, k) => s + (k.inflight || 0), 0)}</span><span className="text-[10px] text-body font-bold">{t.api.labelConc}</span></div>
                   </div>
                 </div>
-                <div className="col-span-12 lg:col-span-8 glass-card rounded-2xl overflow-hidden flex flex-col shadow-sm">
-                  <div className="p-6 flex items-center justify-between border-b border-hairline">
-                    <span className="font-bold">{t.api.activeAccessKeys}</span>
-                    <div className="flex gap-2">
-                      <CustomInput value={newKey} onChange={setNewKey} placeholder={t.api.keyPlaceholder} className="!w-64 !py-2 !bg-canvas-soft !border-hairline" mono />
-                      <button onClick={handleAddKey} disabled={!newKey.trim()} className="bg-ink text-white px-4 py-2 rounded-lg font-bold text-sm hover:bg-neutral-800 transition-all disabled:opacity-50">{t.common.add}</button>
+                <div className="glass-card rounded-2xl overflow-hidden flex flex-col shadow-sm">
+                  <div className="p-6 border-b border-hairline space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold">{t.api.activeAccessKeys}</span>
+                      <button onClick={fetchApiKeys} className="text-[10px] font-bold text-body uppercase tracking-widest hover:text-ink">{t.api.refresh}</button>
                     </div>
+                    <div className="grid grid-cols-12 gap-2">
+                      <CustomInput value={keyName} onChange={setKeyName} placeholder={t.api.namePlaceholder} className="col-span-12 md:col-span-4 !py-2 !bg-canvas-soft !border-hairline" />
+                      <CustomInput value={newKey} onChange={setNewKey} placeholder={t.api.keyPlaceholder} className="col-span-12 md:col-span-8 !py-2 !bg-canvas-soft !border-hairline" mono />
+                      <select value={keyStrategy} onChange={e => setKeyStrategy(Number(e.target.value))} className="col-span-12 md:col-span-4 rounded-lg border border-hairline bg-canvas-soft px-3 py-2 text-xs font-medium text-ink cursor-pointer">
+                        <option value={1}>{t.api.strategyFill}</option>
+                        <option value={2}>{t.api.strategyRoundRobin}</option>
+                      </select>
+                      <CustomInput value={keyRpm} onChange={setKeyRpm} placeholder={t.api.rpmPlaceholder} className="col-span-6 md:col-span-2 !py-2 !bg-canvas-soft !border-hairline" mono />
+                      <CustomInput value={keyConc} onChange={setKeyConc} placeholder={t.api.concPlaceholder} className="col-span-6 md:col-span-2 !py-2 !bg-canvas-soft !border-hairline" mono />
+                      <div className="col-span-12 md:col-span-4 flex gap-2">
+                        <button onClick={handleGenerateKey} className="flex-1 border border-hairline rounded-lg px-3 py-2 text-xs font-bold text-body hover:text-ink transition-all whitespace-nowrap">{t.api.generateShort}</button>
+                        <button onClick={handleAddKey} disabled={!newKey.trim() || savingKey} className="flex-1 bg-ink text-white px-4 py-2 rounded-lg font-bold text-sm hover:bg-neutral-800 transition-all disabled:opacity-50">{t.common.add}</button>
+                      </div>
+                    </div>
+                    <p className="text-[10px] text-body font-medium leading-relaxed">{t.api.limitHint}</p>
                   </div>
                   <div className="overflow-x-auto">
-                    <table className="w-full text-left">
-                      <thead className="bg-canvas-soft/50 border-b border-hairline"><tr>{['Key String', 'Actions'].map(h => (<th key={h} className="px-6 py-4 text-[10px] font-semibold text-body uppercase tracking-widest">{h}</th>))}</tr></thead>
+                    <table className="w-full min-w-[700px] text-left">
+                      <thead className="bg-canvas-soft/50 border-b border-hairline"><tr>{[t.api.colName, t.api.colKey, t.api.colStrategy, t.api.colUsage, t.api.colStatus, t.api.colActions].map(h => (<th key={h} className="px-4 py-4 text-[10px] font-semibold text-body uppercase tracking-widest whitespace-nowrap">{h}</th>))}</tr></thead>
                       <tbody className="divide-y divide-hairline">
-                        {apiConfig.allowed_keys.length === 0 ? (
-                          <tr><td colSpan={2} className="py-6 text-center text-xs text-body font-medium">{t.api.noKeys}</td></tr>
-                        ) : apiConfig.allowed_keys.map((key) => (
-                          <tr key={key} className="hover:bg-canvas-soft/30 transition-colors">
-                            <td className="px-6 py-5 font-mono text-xs tracking-wider text-body opacity-80 select-all break-all">{key}</td>
-                            <td className="px-6 py-5 text-right">
+                        {apiKeys.length === 0 ? (
+                          <tr><td colSpan={6} className="py-6 text-center text-xs text-body font-medium">{t.api.noKeys}</td></tr>
+                        ) : apiKeys.map((entry) => (
+                          <tr key={entry.api_key} className={`hover:bg-canvas-soft/30 transition-colors ${entry.enabled ? '' : 'opacity-45'}`}>
+                            <td className="px-4 py-4 text-xs font-bold text-ink whitespace-nowrap">{entry.name || <span className="text-body font-normal">—</span>}</td>
+                            <td className="px-4 py-4 font-mono text-[11px] tracking-wider text-body opacity-80 select-all whitespace-nowrap" title={entry.api_key}>{maskKey(entry.api_key)}</td>
+                            <td className="px-4 py-4">
+                              <select value={entry.strategy} onChange={e => { void handleSaveKey({ api_key: entry.api_key, strategy: Number(e.target.value) }) }} className="rounded-lg border border-hairline bg-transparent px-2 py-1 text-[11px] font-bold text-ink cursor-pointer">
+                                <option value={1}>{t.api.strategyFillShort}</option>
+                                <option value={2}>{t.api.strategyRoundRobinShort}</option>
+                              </select>
+                            </td>
+                            <td className="px-4 py-4">
+                              <div className="flex flex-col gap-1 text-[10px] font-mono text-body whitespace-nowrap">
+                                <div className="flex items-center gap-1.5">
+                                  <span className="w-9 opacity-70">{t.api.labelRpm}</span>
+                                  <input type="number" min={0} defaultValue={entry.rpm_limit} onBlur={e => { const v = Math.max(0, Number(e.target.value) || 0); if (v !== entry.rpm_limit) void handleSaveKey({ api_key: entry.api_key, rpm_limit: v }) }} className="w-14 rounded border border-hairline bg-canvas-soft px-1 py-0.5 text-[10px] text-ink" />
+                                  <span className="opacity-60">{entry.rpm_used ?? 0} / {entry.rpm_limit || t.api.unlimited}</span>
+                                </div>
+                                <div className="flex items-center gap-1.5">
+                                  <span className="w-9 opacity-70">{t.api.labelConc}</span>
+                                  <input type="number" min={0} defaultValue={entry.concurrency_limit} onBlur={e => { const v = Math.max(0, Number(e.target.value) || 0); if (v !== entry.concurrency_limit) void handleSaveKey({ api_key: entry.api_key, concurrency_limit: v }) }} className="w-14 rounded border border-hairline bg-canvas-soft px-1 py-0.5 text-[10px] text-ink" />
+                                  <span className="opacity-60">{entry.inflight ?? 0} / {entry.concurrency_limit || t.api.unlimited}</span>
+                                </div>
+                              </div>
+                            </td>
+                            <td className="px-4 py-4">
+                              <button onClick={() => handleToggleKeyEnabled(entry)} className={`w-9 h-5 rounded-full p-0.5 transition-colors relative ${entry.enabled ? 'bg-ink' : 'bg-hairline-strong'}`}>
+                                <div className={`w-4 h-4 bg-white rounded-full transition-transform duration-200 ${entry.enabled ? 'translate-x-4' : 'translate-x-0'}`}></div>
+                              </button>
+                            </td>
+                            <td className="px-4 py-4 text-right">
                               <div className="flex justify-end gap-2">
-                                <button onClick={() => handleCopyKey(key)} className="p-1.5 text-body hover:text-ink" title="Copy"><span className="material-symbols-outlined text-[18px]">{copiedKey === key ? 'check_circle' : 'content_copy'}</span></button>
-                                <button onClick={() => handleDeleteKey(key)} className="p-1.5 text-red-400 hover:text-red-600" title="Delete"><span className="material-symbols-outlined text-[18px]">block</span></button>
+                                <button onClick={() => handleCopyKey(entry.api_key)} className="p-1.5 text-body hover:text-ink" title="Copy"><span className="material-symbols-outlined text-[18px]">{copiedKey === entry.api_key ? 'check_circle' : 'content_copy'}</span></button>
+                                <button onClick={() => handleDeleteKey(entry.api_key)} className="p-1.5 text-red-400 hover:text-red-600" title="Delete"><span className="material-symbols-outlined text-[18px]">block</span></button>
                               </div>
                             </td>
                           </tr>
