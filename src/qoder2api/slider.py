@@ -104,25 +104,36 @@ def locate_gap(bg_png: bytes, puzzle_png: bytes) -> dict | None:
     resid = (ssq - (num ** 2) / denom) / n_core
     resid = np.nan_to_num(resid, nan=1e18, posinf=1e18, neginf=1e18)
 
-    iy, ix = np.unravel_index(int(np.argmin(resid)), resid.shape)
+    # 全图 argmin 仅作参考；真实匹配限制在 y0±3 行带内（见下）
+    iy_all, _ = np.unravel_index(int(np.argmin(resid)), resid.shape)
+    alpha = float(num[iy_all, int(np.argmin(resid[iy_all]))]) / denom
+    med = float(np.median(resid))
+
+    # 不变量：拼图块在 canvas 里的 y0 == 缺口 y（拖动只动 x，y 固定）。
+    # 全图 argmin 会被背景其它强纹理行抢走（实测假匹配 gap_y=0/4，quality 0.01~0.32），
+    # 因此把最优搜索限制在 y0±3 行带内，y 天然一致，x 在带内取最优。
+    band_lo = max(0, y0 - 3)
+    band_hi = min(resid.shape[0] - 1, y0 + 3)
+    if band_hi < band_lo:                                    # y0 越界（模板放不下）→ 兜底全图
+        band_lo = band_hi = int(iy_all)
+    band = resid[band_lo:band_hi + 1]
+    by, bx = np.unravel_index(int(np.argmin(band)), band.shape)
+    iy, ix = band_lo + int(by), int(bx)
     best = float(resid[iy, ix])
     gx, gy = int(ix), int(iy)
     alpha = float(num[iy, ix]) / denom
-    med = float(np.median(resid))
-    r_y, r_x = max(3, ph // 3), max(3, pw // 3)              # 屏蔽最优点取次优
-    tmp = resid.copy()
-    tmp[max(0, gy - r_y):gy + r_y + 1, max(0, gx - r_x):gx + r_x + 1] = 1e18
+    r_x = max(3, pw // 3)                                    # 屏蔽最优点取次优
+    tmp = band.copy()
+    tmp[:, max(0, gx - r_x):gx + r_x + 1] = 1e18
     second = float(tmp.min())
     quality = 1.0 - (best / second) if second > 0 else 0.0
-    # 可信度闸门（实测校准，见 logs/slider 复盘）：
-    #   真缺口 alpha≈0.16~0.36（白罩混合系数），gap_y 必然等于 piece_y0
-    #   假匹配样本：alpha=0.9975、gap_y 132≠piece_y0 129、quality 0.17 —— 必须拦住
+    # 可信度闸门（band 内判别）：alpha 仍按白罩混合系数校验；quality 为带内最优/次优比
     bad: list[str] = []
     if not (0.05 <= alpha <= 0.90):
         bad.append("alpha=%.3f" % alpha)
     if abs(gy - y0) > 2:
         bad.append("gap_y=%d!=piece_y0=%d" % (gy, y0))
-    if quality < 0.10:
+    if quality < 0.02:
         bad.append("quality=%.3f" % quality)
     return {
         "gap_x": gx, "gap_y": gy,
