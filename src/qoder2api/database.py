@@ -81,5 +81,16 @@ def init_db():
         except Exception:
             pass
 
+        # email / password 列（幂等：已存在则忽略）
+        # password 为注册时随机生成，落库仅用于本地管理，切勿外泄
+        for _ddl in (
+            "ALTER TABLE accounts ADD COLUMN email TEXT",
+            "ALTER TABLE accounts ADD COLUMN password TEXT",
+        ):
+            try:
+                conn.execute(_ddl)
+            except Exception:
+                pass
+
 
 init_db()

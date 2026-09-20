@@ -961,12 +961,14 @@ def _save_account(task_id: str, acct: dict, cred: dict) -> str:
         conn.execute(
             """
             INSERT OR REPLACE INTO accounts (
-                uid, name, user_type, security_oauth_token, refresh_token, machine_id,
+                uid, name, user_type, email, password,
+                security_oauth_token, refresh_token, machine_id,
                 enabled, last_status, last_error, quota, is_quota_exceeded, plan, user_tag, next_reset_at, token_expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ok', NULL, 0, 0, 'PLAN_TIER_PRO_TRIAL', 'Pro Trial', NULL, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ok', NULL, 0, 0, 'PLAN_TIER_PRO_TRIAL', 'Pro Trial', NULL, ?)
             """,
             (
                 uid, acct.get("name") or "Registered", "personal_standard",
+                acct.get("email"), acct.get("password"),
                 cred.get("token", ""), cred.get("refresh_token", ""), machine_id,
                 enabled, cred.get("expires_at") or "",
             ),
