@@ -206,3 +206,65 @@ const _$d = (s, k = "syJkkdK5Dxwd") => {
 - [ ] QoderGateway 增加新版协议适配：`bridge.py` 新增 `api2-v2.qoder.sh/model/v1/chat/completions` 路径（纯 Bearer，无需 COSY 签名）
 - [ ] 增加 token 自动刷新：定时/请求前检查 `expires_at`，用 `jobToken/refresh` 换新并回写数据库
 - [ ] 自动化 device flow 脚本：生成 verifier/challenge → 打印授权 URL → 轮询 poll → 拿到凭据自动入库
+
+---
+
+## 10. 协议路由决策（2026-09-20 更新，实测）
+
+> 结论先行：**所有模型统一走老版 api3 协议**（COSY 签名 + `X-Model-Key` + `encoding.encode` 编码 body + tool_calls 分片合并）。
+> 新版 api2-v2 协议**保留观察**：未来若全模型可用再切换，当前不作为主路径。
+
+### 10.1 模型可用性实测（Reqable 抓包 IDE + 单账号脚本实测）
+
+| 协议通道 | lite | qfmodel | 其余 11 个目录模型 |
+|---|---|---|---|
+| 新版 `api2-v2.qoder.sh/model/v1/chat/completions` | ✅ 200 | ❌ 402 `{"code":116,"error":"quota exceeded"}` | ❌ 402 |
+| 老版 `api3.qoder.sh/.../agent_chat_generation` | ✅ 200 | ✅ 200（2.8s 出字，工具调用全链路通过） | ❌ HTTP 200 后**挂起零输出**（auto 给到 150s 仍无首 token） |
+
+- `qfmodel` 是 Qoder IDE（0.3.4 / Cosy 1.1.57）的默认模型 key：抓包证实 IDE 请求头为 `X-Model-Key: qfmodel` + `X-Model-Source: system`，SSE 响应 `model` 字段为 `auto`（档位名，非具体模型 id）。
+- **其余 11 个目录模型（auto/ultimate/performance/efficient/qmodel/qmodel_latest/dmodel/dfmodel/gm51model/kmodel/mmodel）不可用是账号问题，不是协议问题**：老版协议下它们连接被接受但无限挂起（不报错），新版协议下至少返回 402；推测账号等级/配额池为空，等账号权限变化后同一套老版代码即可直接生效，无需改协议。
+- 复测脚本：`scripts/test_qfmodel_old.py`（老版多模型）、`scripts/test_one_model.py`（单模型长超时）、`scripts/test_qfmodel_tools.py`（工具调用链路）、`scripts/test_qfmodel.py`（新版对照）。原始日志 `logs/old_proto_all_models.log`。
+
+### 10.2 路由规则
+
+```
+请求 model key
+   └─ 一律走老版 api3：COSY 签名（auth.bearer_headers）+ template_base() 构造 body
+      + model_config.key / chat_context.extra.modelConfig.key 双写
+      + X-Model-Key / X-Model-Source: system 头
+      + encoding.encode() 编码 body
+      + 响应解析复用 bridge.ToolCallAccumulator（tool_calls 分片按 index 合并）
+      + 过滤 reasoning_content 空帧
+```
+
+### 10.3 必须注意的坑
+
+1. **挂起失败模式**：老版协议下无权限/无配额模型不报错、不吐字，无限挂起。网关侧**必须加读超时兜底**（建议 60s 无首 token 即断开并切换账号重试），否则连接会被无限占用。
+2. **tool_calls 分片**：老版 SSE 的 tool_calls 首帧含 `id`+`name`，后续帧仅 `arguments` 增量，必须按 `index` 合并才能得到完整参数。
+3. **响应 `model` 字段是档位名**（如 `auto`），不是具体模型 id，网关回给客户端的 model 建议用请求时的 key。
+4. `usage` 在最后独立帧返回，含 `credits` 计费字段；`billable: false` 表示该帧不计费。
+
+> **实现状态（2026-09-20 已落地）**：`bridge.py` 已切老版协议（`USE_OLD_PROTOCOL` 默认 1），
+> 首字超时（`FIRST_TOKEN_TIMEOUT=60s`，只认非空非 SSE 注释行）、流中读超时（`STREAM_READ_TIMEOUT=120s`）、
+> 错误帧识别（`UpstreamErrorFrame`，body 含 `code/message` 无 `choices`，实测不可用模型 0.8s 返回 code=112+pricingUrl）、
+> 挂起识别（`UpstreamHangError`）均已实现；`app.is_account_error` 对这两个异常返回 True，触发账号轮换。
+> 环境变量可调：`QODER_USE_OLD_PROTOCOL` / `QODER_FIRST_TOKEN_TIMEOUT` / `QODER_STREAM_READ_TIMEOUT` / `QODER_TOTAL_TIMEOUT`。
+
+### 10.4 未来切换新版的触发条件
+
+- [ ] 上游新版 api2-v2 通道对非 lite 模型返回 200（不再 402/挂起）
+- [ ] 或账号侧配额/权限在新版通道生效
+- [ ] 满足任一条件后，评估把快路径切回新版（新版优势：无签名、响应快、无挂起风险，`lite` 档实测快 3~6 倍）
+
+---
+
+## 11. 模型目录（QODER_MODELS）
+
+后端目录定义在 `src/qoder2api/bridge.py`（`QODER_MODELS` 常量），经 `GET /v1/models` 发现端点（`src/qoder2api/app.py`）对外暴露，供 OpenAI 兼容客户端与前端 Playground 下拉使用。chat 请求的 model 为透传，不做硬校验。
+
+| 分类 | key |
+|---|---|
+| 档位模型 | `auto` / `ultimate` / `performance` / `efficient` / `lite` |
+| frontier 模型 | `qmodel` / `qmodel_latest` / `dmodel` / `dfmodel` / `gm51model` / `kmodel` / `mmodel` |
+
+> 注：`qfmodel`（IDE 默认）**不在**上述目录中——它不在 keirouter 的清单里，是 2026-09-20 抓包新发现的 key。若要支持 IDE 默认档位，需把它补进 `QODER_MODELS`。

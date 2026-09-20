@@ -13,7 +13,7 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .auth import SessionContext, create_session, load_local_session
-from .bridge import complete_openai_response, stream_openai_response
+from .bridge import QODER_MODELS, UpstreamErrorFrame, UpstreamHangError, complete_openai_response, stream_openai_response
 from .config import (
     load_config,
     save_config,
@@ -430,18 +430,26 @@ def is_quota_error(exc: Exception) -> bool:
 
 
 def is_account_error(exc: Exception) -> bool:
-    """判断是否'账号级'错误（token 无效/限额/服务端拒绝）。只有这类才应跳过账户。
+    """判断是否'账号级'错误（token 无效/限额/服务端拒绝/上游挂起）。只有这类才应跳过账户。
 
-    网络/流中断/超时（如 httpx.ReadError 的 incomplete chunk read）是临时性问题，
+    网络/流中断/读错误（如 httpx.ReadError 的 incomplete chunk read）是临时性问题，
     换账户也无效，不应触发 rotate。
+    但 bridge.UpstreamHangError（老版协议 HTTP 200 后挂起、首字超时）属于账号/模型级
+    不可用，换账号有可能恢复，必须触发 rotate。
     """
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in (401, 403, 429)
     if isinstance(exc, httpx.HTTPError):
         return False  # 连接/超时/读错误等网络问题
+    # 老版协议专用：错误帧（code=112 等）/ 首字挂起，均属账号/模型级不可用，换账号可能恢复
+    if isinstance(exc, (UpstreamErrorFrame, UpstreamHangError)):
+        return True
     if isinstance(exc, RuntimeError):
         msg = str(exc).lower()
         if any(code in msg for code in ("http 401", "http 403", "http 429")):
+            return True
+        # 上游挂起（首字超时）：老版协议对无配额模型的典型失败模式，换账号可能恢复
+        if "hang" in msg or "first token" in msg:
             return True
         for kw in ("unauthorized", "invalid token", "quota", "rate limit",
                    "insufficient", "personal token", "credit"):
@@ -465,6 +473,40 @@ async def _pick_session(key_cfg: dict[str, Any] | None, model: str, tried: set[s
     if not uid:
         raise ValueError("No available account left for this API key.")
     return get_session_for_uid(uid)
+
+
+@app.get("/v1/models")
+async def list_models(authorization: str | None = Header(default=None)):
+    """OpenAI 兼容模型发现端点：返回 Qoder 已知模型目录（bridge.QODER_MODELS）。
+
+    开启鉴权时与 /v1/chat/completions 一致要求有效 API Key。
+    """
+    config = load_config()
+    if bool(config.get("auth_required", False)):
+        incoming_key = ""
+        if authorization and authorization.startswith("Bearer "):
+            incoming_key = authorization[len("Bearer "):].strip()
+        valid = any(
+            _k.get("api_key") and _k.get("api_key") == incoming_key and _k.get("enabled")
+            for _k in config.get("api_keys", [])
+        )
+        if not valid:
+            add_log("Access denied on /v1/models: Invalid or missing API Key.", "WARNING")
+            raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+    now = int(datetime.now().timestamp())
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": m["id"],
+                "object": "model",
+                "created": now,
+                "owned_by": "qoder",
+                "display_name": m["name"],
+            }
+            for m in QODER_MODELS
+        ],
+    }
 
 
 @app.post("/v1/chat/completions")
@@ -560,7 +602,7 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
             except Exception as exc:
                 current_uid = session_obj.identity.uid if session_obj is not None else "unknown"
                 if is_account_error(exc):
-                    if is_quota_error(exc):
+                    if is_quota_error(exc) and not isinstance(exc, UpstreamErrorFrame):
                         # quota 类错误：先发一次请求确认是否真正 exceeded，而不是直接跳过
                         q = get_account_quota(current_uid)
                         if q.get("ok"):

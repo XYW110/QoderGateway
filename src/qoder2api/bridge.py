@@ -1,5 +1,7 @@
+import asyncio
 import copy
 import json
+import os
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -16,7 +18,54 @@ from .env import httpx_client_kwargs
 QODER_CHAT_URL = "https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"
 # 新版协议（Qoder CLI 现行）：OpenAI 兼容端点，纯 Bearer，无 COSY 签名，响应为标准 OpenAI SSE。
 # 性能远优于老版（老版默认带长 reasoning，复杂任务可到分钟级）。
+# 当前不作为主路径：实测非 lite 模型在新版通道全部 402，详见 docs/qoder-protocol-research.md §10。
+# 未来新版全模型可用后，把 QODER_USE_OLD_PROTOCOL 置 0 即可切回。
 QODER_CHAT_URL_NEW = "https://api2-v2.qoder.sh/model/v1/chat/completions"
+
+# 协议路由：默认全部模型走老版 api3（COSY 签名 + X-Model-Key + encoding.encode）。
+USE_OLD_PROTOCOL = os.getenv("QODER_USE_OLD_PROTOCOL", "1").strip().lower() not in {"0", "false", "no", "off"}
+# 首字超时：老版协议对无权限/无配额的模型不报错、无限挂起（HTTP 200 后零字节），
+# 必须靠首字超时判定"挂起"并触发账号轮换，否则连接被无限占用。
+FIRST_TOKEN_TIMEOUT = float(os.getenv("QODER_FIRST_TOKEN_TIMEOUT", "60"))
+# 流中读超时：首字之后单个 chunk 间隔上限，防半路挂起。
+STREAM_READ_TIMEOUT = float(os.getenv("QODER_STREAM_READ_TIMEOUT", "120"))
+# 非流式总超时。
+TOTAL_TIMEOUT = float(os.getenv("QODER_TOTAL_TIMEOUT", "300"))
+
+
+class UpstreamHangError(RuntimeError):
+    """上游挂起：HTTP 200 但首字超时（老版协议对无配额模型的典型失败模式）。
+
+    消息中固定含 "hang" / "first token" 关键词，app.is_account_error 据此判定为
+    账号级错误并轮换下一个账号。
+    """
+
+
+class UpstreamErrorFrame(RuntimeError):
+    """老版协议 SSE 错误帧：data 包裹的 body 内含 code/message 而非 choices。
+
+    实测无配额/无权限模型（auto/ultimate/... 11 个）会立即返回此类帧
+    （如 code=112 + pricingUrl），随后不再吐字。必须识别为账号级错误并轮换，
+    否则会被当成空流干等读超时。
+    """
+
+# Qoder 模型 key 清单（参照 mydisha/keirouter 的 qoder provider 模型目录）：
+# 前 5 个为档位模型，后 7 个为 frontier 模型。仅用于 /v1/models 发现端点与
+# 前端 Playground 下拉提示；chat 请求的 model 仍为透传（不做硬校验）。
+QODER_MODELS: list[dict[str, str]] = [
+    {"id": "auto", "name": "Auto"},
+    {"id": "ultimate", "name": "Ultimate"},
+    {"id": "performance", "name": "Performance"},
+    {"id": "efficient", "name": "Efficient"},
+    {"id": "lite", "name": "Lite"},
+    {"id": "qmodel", "name": "Q Model"},
+    {"id": "qmodel_latest", "name": "Q Model (Latest)"},
+    {"id": "dmodel", "name": "D Model"},
+    {"id": "dfmodel", "name": "DF Model"},
+    {"id": "gm51model", "name": "GM 5.1 Model"},
+    {"id": "kmodel", "name": "K Model"},
+    {"id": "mmodel", "name": "M Model"},
+]
 
 
 def now_ms() -> int:
@@ -239,28 +288,33 @@ def build_qoder_messages(template_messages: list[dict[str, Any]], incoming: list
 
 
 def build_qoder_body(req: dict[str, Any], sess: SessionContext) -> tuple[dict[str, Any], str, bool]:
-    """新版协议 body：OpenAI 原生格式，直接透传 messages/tools。"""
+    """老版协议 body：template_base() 骨架 + model key 双写 + OpenAI messages/tools 转换。
+
+    model key 必须同时写入 model_config.key 与 chat_context.extra.modelConfig.key，
+    并随请求头 X-Model-Key 一起下发（与 Qoder IDE 实测一致）。
+    消息转换复用 build_qoder_messages（system 注入 / tool 消息 / tool_calls 归一化）。
+    """
     model = req.get("model") or "lite"
     messages = req.get("messages") if isinstance(req.get("messages"), list) else []
     tools_enabled = bool(req.get("tools"))
-    rid = str(uuid.uuid4())
-    body: dict[str, Any] = {
-        "model": model,
-        "messages": copy.deepcopy(messages or []),
-        "stream": True,
-        "stream_options": {"include_usage": True},
-        "metadata": {
-            "context": {
-                "request_id": rid,
-                "request_set_id": rid,
-                "session_id": str(uuid.uuid4()),
-                "task_id": "common",
-                "client_type": "qodercli",
-            }
-        },
-    }
-    if tools_enabled:
-        body["tools"] = copy.deepcopy(req["tools"])
+
+    body = template_base()
+    body["chat_context"]["extra"]["modelConfig"]["key"] = model
+    body["chat_context"]["extra"]["modelConfig"]["display_name"] = model
+    body["model_config"]["key"] = model
+    body["model_config"]["display_name"] = model
+    body["model_config"]["source"] = "system"
+    body["session_id"] = str(uuid.uuid4())
+    body["business"]["name"] = "qoder2api"
+    prompt = extract_latest_user_prompt(messages)
+    body["chat_context"]["chatPrompt"] = prompt
+    body["chat_context"]["text"] = {"type": "text", "text": prompt}
+    system_messages = [m for m in body["messages"] if m.get("role") == "system"]
+    body["messages"] = build_qoder_messages(system_messages, messages, prompt, tools_enabled)
+    body["tools"] = copy.deepcopy(req["tools"]) if tools_enabled else []
+    max_tokens = req.get("max_tokens")
+    if isinstance(max_tokens, int) and max_tokens > 0:
+        body["parameters"]["max_tokens"] = max_tokens
     return body, model, tools_enabled
 
 
@@ -335,8 +389,119 @@ class ToolCallAccumulator:
         return copy.deepcopy(self.calls)
 
 
+def build_new_protocol_body(req: dict[str, Any]) -> tuple[dict[str, Any], str, bool]:
+    """新版协议 body（备用路径，USE_OLD_PROTOCOL=0 时启用）：OpenAI 原生格式。"""
+    model = req.get("model") or "lite"
+    messages = req.get("messages") if isinstance(req.get("messages"), list) else []
+    tools_enabled = bool(req.get("tools"))
+    rid = str(uuid.uuid4())
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": copy.deepcopy(messages or []),
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "metadata": {
+            "context": {
+                "request_id": rid,
+                "request_set_id": rid,
+                "session_id": str(uuid.uuid4()),
+                "task_id": "common",
+                "client_type": "qodercli",
+            }
+        },
+    }
+    if tools_enabled:
+        body["tools"] = copy.deepcopy(req["tools"])
+    return body, model, tools_enabled
+
+
+def raise_if_error_frame(line: str, model: str, account_uid: str) -> None:
+    """老版协议错误帧检测：data 包裹的 body 是 {"code":..., "message":...} 而非 choices。
+
+    正常内容帧的 body 一定含 choices；错误帧只含 code/message。命中即抛
+    UpstreamErrorFrame（账号级错误，触发轮换）。
+    """
+    if not line.startswith("data:"):
+        return
+    raw = line[5:].strip()
+    if not raw or raw == "[DONE]":
+        return
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(obj, dict):
+        return
+    inner = obj.get("body")
+    if not isinstance(inner, str):
+        return
+    try:
+        payload = json.loads(inner)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(payload, dict) or "choices" in payload:
+        return
+    code = payload.get("code")
+    message = payload.get("message") or payload.get("error") or ""
+    if code or message:
+        raise UpstreamErrorFrame(
+            f"Upstream error frame: code={code} message={message} (model={model}, account={account_uid})"
+        )
+
+
 async def qoder_stream_lines(sess: SessionContext, body: dict[str, Any], model: str) -> AsyncIterator[str]:
-    """新版协议：POST api2-v2.qoder.sh/model/v1/chat/completions，Bearer 直连。"""
+    """老版协议：POST api3 agent_chat_generation，COSY 签名 + encoding.encode body + X-Model-Key。
+
+    失败模式与兜底：
+    - 非 200：抛 RuntimeError（含 HTTP 状态码，走 app.is_account_error 判定轮换）
+    - 200 但 FIRST_TOKEN_TIMEOUT 内无任何字节：抛 UpstreamHangError（挂起，触发轮换）
+    - 首字之后 STREAM_READ_TIMEOUT 内无数据：httpx.ReadTimeout（临时错误）
+    """
+    payload = encoding.encode(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode())
+    headers = bearer_headers(sess, QODER_CHAT_URL, payload, "text/event-stream",
+                             extra_headers={"X-Model-Key": model, "X-Model-Source": "system"})
+    timeout = httpx.Timeout(connect=15, read=STREAM_READ_TIMEOUT, write=60, pool=60)
+    async with httpx.AsyncClient(timeout=timeout, **httpx_client_kwargs()) as client:
+        async with client.stream("POST", QODER_CHAT_URL, content=payload, headers=headers) as response:
+            if response.status_code != 200:
+                text = await response.aread()
+                raise RuntimeError(f"HTTP {response.status_code} {text.decode(errors='replace')}")
+            line_iter = response.aiter_lines()
+            # 首字超时：老版协议对无配额模型 HTTP 200 后无限挂起（可能先吐空行/注释行充数），
+            # 只认非空、非 SSE 注释的行为"首字"。
+            first: str | None = None
+            deadline = time.monotonic() + FIRST_TOKEN_TIMEOUT
+            try:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        line = await asyncio.wait_for(line_iter.__anext__(), timeout=remaining)
+                    except StopAsyncIteration:
+                        return
+                    stripped = (line or "").strip()
+                    if stripped and not stripped.startswith(":"):
+                        raise_if_error_frame(line, model, sess.identity.uid)
+                        first = line
+                        break
+            except asyncio.TimeoutError:
+                first = None
+            if first is None:
+                raise UpstreamHangError(
+                    f"Upstream hang: no first token within {FIRST_TOKEN_TIMEOUT:.0f}s "
+                    f"(model={model}, account={sess.identity.uid})"
+                )
+            yield first
+            async for line in line_iter:
+                if line:
+                    raise_if_error_frame(line, model, sess.identity.uid)
+                    yield line
+
+
+async def new_protocol_stream_lines(req: dict[str, Any], sess: SessionContext) -> AsyncIterator[str]:
+    """新版协议（备用路径）：POST api2-v2.qoder.sh/model/v1/chat/completions，Bearer 直连。"""
+    body, _, _ = build_new_protocol_body(req)
     ctx = (body.get("metadata") or {}).get("context") or {}
     headers = {
         "Authorization": f"Bearer {sess.identity.security_oauth_token}",
@@ -346,7 +511,7 @@ async def qoder_stream_lines(sess: SessionContext, body: dict[str, Any], model: 
         "X-Request-ID": ctx.get("request_id", ""),
         "X-Session-ID": ctx.get("session_id", ""),
     }
-    async with httpx.AsyncClient(timeout=httpx.Timeout(300, connect=15), **httpx_client_kwargs()) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(TOTAL_TIMEOUT, connect=15), **httpx_client_kwargs()) as client:
         async with client.stream("POST", QODER_CHAT_URL_NEW, json=body, headers=headers) as response:
             if response.status_code != 200:
                 text = await response.aread()
@@ -357,7 +522,12 @@ async def qoder_stream_lines(sess: SessionContext, body: dict[str, Any], model: 
 
 
 async def stream_openai_response(req: dict[str, Any], sess: SessionContext) -> AsyncIterator[str]:
-    body, model, tools_enabled = build_qoder_body(req, sess)
+    if USE_OLD_PROTOCOL:
+        body, model, tools_enabled = build_qoder_body(req, sess)
+        lines = qoder_stream_lines(sess, body, model)
+    else:
+        _, model, tools_enabled = build_new_protocol_body(req)
+        lines = new_protocol_stream_lines(req, sess)
     chunk_id = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
     tool_calls = ToolCallAccumulator()
@@ -431,12 +601,17 @@ async def stream_openai_response(req: dict[str, Any], sess: SessionContext) -> A
 
 
 async def complete_openai_response(req: dict[str, Any], sess: SessionContext) -> dict[str, Any]:
-    body, model, tools_enabled = build_qoder_body(req, sess)
+    if USE_OLD_PROTOCOL:
+        body, model, tools_enabled = build_qoder_body(req, sess)
+        lines = qoder_stream_lines(sess, body, model)
+    else:
+        _, model, tools_enabled = build_new_protocol_body(req)
+        lines = new_protocol_stream_lines(req, sess)
     completion_id = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
     full = []
     tool_calls = ToolCallAccumulator()
-    async for line in qoder_stream_lines(sess, body, model):
+    async for line in lines:
         if not line.startswith("data:"):
             continue
         delta = extract_delta(line[5:].strip())
