@@ -65,8 +65,15 @@ def _to_bgr(img: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------- 缺口定位
-def locate_gap(bg_png: bytes, puzzle_png: bytes) -> dict | None:
-    """返回缺口信息（背景图自然像素坐标系）或 None。"""
+def locate_gap(bg_png: bytes, puzzle_png: bytes, *, y_tol: int = 2, band: int = 3) -> dict | None:
+    """返回缺口信息（背景图自然像素坐标系）或 None。
+
+    y_tol: 可信度闸门里 |gap_y - piece_y0| 的允许偏差。
+    band:  最优搜索限制在 piece_y0 ± band 行内（背景强纹理行会抢走全图 argmin）。
+    两者必须一致——曾出现 band=3 允许匹配、闸门 y_tol=2 又把它判死的自相矛盾
+    （实测 gap_y=68 != piece_y0=65）。拼图块 y0 与缺口 y 有数像素缩放/抗锯齿偏差，
+    而拖动只动 x，y 仅作防假匹配用，故 relax 时把偏差容忍放到 6 仍安全。
+    """
     if not bg_png or not puzzle_png:
         return None
     bg = np.array(Image.open(io.BytesIO(bg_png)).convert("RGB")).astype(np.float32)
@@ -109,21 +116,21 @@ def locate_gap(bg_png: bytes, puzzle_png: bytes) -> dict | None:
     alpha = float(num[iy_all, int(np.argmin(resid[iy_all]))]) / denom
     med = float(np.median(resid))
 
-    # 不变量：拼图块在 canvas 里的 y0 == 缺口 y（拖动只动 x，y 固定）。
+    # 不变量：拼图块在 canvas 里的 y0 ≈ 缺口 y（拖动只动 x，y 固定）。
     # 全图 argmin 会被背景其它强纹理行抢走（实测假匹配 gap_y=0/4，quality 0.01~0.32），
-    # 因此把最优搜索限制在 y0±3 行带内，y 天然一致，x 在带内取最优。
-    band_lo = max(0, y0 - 3)
-    band_hi = min(resid.shape[0] - 1, y0 + 3)
+    # 因此把最优搜索限制在 y0±band 行带内，y 天然一致，x 在带内取最优。
+    band_lo = max(0, y0 - band)
+    band_hi = min(resid.shape[0] - 1, y0 + band)
     if band_hi < band_lo:                                    # y0 越界（模板放不下）→ 兜底全图
         band_lo = band_hi = int(iy_all)
-    band = resid[band_lo:band_hi + 1]
-    by, bx = np.unravel_index(int(np.argmin(band)), band.shape)
+    band_arr = resid[band_lo:band_hi + 1]
+    by, bx = np.unravel_index(int(np.argmin(band_arr)), band_arr.shape)
     iy, ix = band_lo + int(by), int(bx)
     best = float(resid[iy, ix])
     gx, gy = int(ix), int(iy)
     alpha = float(num[iy, ix]) / denom
     r_x = max(3, pw // 3)                                    # 屏蔽最优点取次优
-    tmp = band.copy()
+    tmp = band_arr.copy()
     tmp[:, max(0, gx - r_x):gx + r_x + 1] = 1e18
     second = float(tmp.min())
     quality = 1.0 - (best / second) if second > 0 else 0.0
@@ -131,7 +138,7 @@ def locate_gap(bg_png: bytes, puzzle_png: bytes) -> dict | None:
     bad: list[str] = []
     if not (0.05 <= alpha <= 0.90):
         bad.append("alpha=%.3f" % alpha)
-    if abs(gy - y0) > 2:
+    if abs(gy - y0) > y_tol:
         bad.append("gap_y=%d!=piece_y0=%d" % (gy, y0))
     if quality < 0.02:
         bad.append("quality=%.3f" % quality)
@@ -484,6 +491,18 @@ def solve(page, *, dump_dir=None, rounds: int = 3, open_popup: bool = True,
             refresh(page)
             time.sleep(2.2)
             continue
+        if not gap.get("valid", True):
+            # 仅 y 偏差超限（alpha/quality 都合格）时，用同一张图放宽闸门重算：
+            # 拼图块 y0 与缺口 y 有数像素缩放偏差，而拖动只动 x，不该因此浪费一次换题
+            reason = gap.get("invalid_reason") or ""
+            only_y = reason.startswith("gap_y=") and "alpha=" not in reason and "quality=" not in reason
+            if only_y:
+                relaxed = locate_gap(bg_b, pz_b, y_tol=6, band=6)
+                if relaxed and relaxed.get("valid"):
+                    print(f"[gap] y 偏差放宽后接受: {reason} -> y_tol=6", flush=True)
+                    gap = relaxed
+                    item["gap"] = gap
+                    item["gap_relaxed"] = reason
         if not gap.get("valid", True):
             item["error"] = "gap-invalid: " + (gap.get("invalid_reason") or "")
             log.append(item)                     # 假匹配绝不拿去拖

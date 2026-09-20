@@ -589,10 +589,53 @@ class RegistrarBot:
         self._locate('css:button[type="submit"]', desc="提交按钮").click()
 
     # ---- 填表（身份断言 + 清空 + 输入后值验证，防串扰） ----
+    @staticmethod
+    def _pick_visible(els: list) -> Any:
+        """从同名元素中挑第一个可见的（ant-design 会渲染隐藏副本，填隐藏框值永远是空）。"""
+        for el in els:
+            try:
+                if el.states.is_displayed and el.states.is_enabled:
+                    return el
+            except Exception:
+                continue
+        for el in els:  # 兜底：可见性判断异常时取第一个
+            try:
+                if el.states.is_displayed:
+                    return el
+            except Exception:
+                return el
+        return els[0] if els else None
+
+    def _fill_via_js(self, el: Any, value: str) -> None:
+        """JS 原生 value setter + input/change 事件兜底。
+
+        CDP 逐字输入对 React 受控组件偶发不触发状态更新（值进了 DOM 但 React 没收到），
+        用原生 setter 绕过 React 的 value 追踪再派发事件，是这类场景的标准解法。
+        """
+        el.run_js(
+            """
+            const el = this, v = arguments[0];
+            const setter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value').set;
+            setter.call(el, v);
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+            """,
+            value,
+        )
+
     def _fill(self, selector: str, value: str, must_id: str | None = None,
               retries: int = 3) -> None:
+        last_got = ""
         for attempt in range(retries):
-            el = self._locate(selector, timeout=10, desc="填表输入框")
+            els = None
+            try:
+                els = self.page.eles(selector, timeout=10)
+            except Exception:
+                els = None
+            el = self._pick_visible(els) if els else None
+            if el is None:
+                el = self._locate(selector, timeout=10, desc="填表输入框")
             el_id = el.attr("id") or ""
             if must_id and el_id != must_id:
                 raise RuntimeError(f"填表定位错误: 期望 #{must_id}，实际 #{el_id} ({selector})")
@@ -600,15 +643,33 @@ class RegistrarBot:
                 el.clear()
             except Exception:
                 pass
-            el.input(value)
+            try:
+                el.input(value)
+            except Exception as e:
+                _log(self.task_id, f"[fill] {selector} input() 异常: {type(e).__name__}: {e}")
             try:
                 got = el.value or ""
             except Exception:
                 got = el.attr("value") or ""
+            if got != value:
+                # CDP 输入没生效 → JS 原生 setter 兜底
+                try:
+                    self._fill_via_js(el, value)
+                except Exception as e:
+                    _log(self.task_id, f"[fill] {selector} JS 兜底异常: {type(e).__name__}: {e}")
+                try:
+                    got = el.value or ""
+                except Exception:
+                    got = el.attr("value") or ""
+            last_got = got
             if got == value:
                 return
-            _log(self.task_id, f"[fill] {selector} 值验证失败(尝试{attempt + 1}): 期望 {value!r} 实际 {got!r}，重试")
-        raise RuntimeError(f"多次填表失败: {selector}")
+            try:
+                states = f"displayed={el.states.is_displayed} enabled={el.states.is_enabled} type={el.attr('type')}"
+            except Exception:
+                states = "states 读取失败"
+            _log(self.task_id, f"[fill] {selector} 值验证失败(尝试{attempt + 1}): 期望 {value!r} 实际 {got!r} [{states}]，重试")
+        raise RuntimeError(f"多次填表失败: {selector} (最后读到的值 {last_got!r})")
 
     # ---- OTP 输入框（兼容新版单框 / 旧版多框）----
     # 实测：新版 OTP 页只有一个 <input autocomplete="one-time-code" maxlength="6">，
