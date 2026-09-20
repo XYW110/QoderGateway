@@ -98,6 +98,18 @@ def init_db():
             except Exception:
                 pass
 
+        # 账号级代理列（幂等）：proxy_enabled=1 时该账号的上游请求走自己的代理
+        for _ddl in (
+            "ALTER TABLE accounts ADD COLUMN proxy_enabled INTEGER DEFAULT 0",
+            "ALTER TABLE accounts ADD COLUMN proxy_url TEXT",
+            "ALTER TABLE accounts ADD COLUMN proxy_username TEXT",
+            "ALTER TABLE accounts ADD COLUMN proxy_password TEXT",
+        ):
+            try:
+                conn.execute(_ddl)
+            except Exception:
+                pass
+
         # allowed_keys 扩展列：名称 / 路由策略 / RPM / 并发 / 启用（幂等，老库自动补齐）
         # strategy: 1=填充(同 key+模型固定账号) 2=轮询(每次请求依次下一个)；limit 0=不限
         for _ddl in (

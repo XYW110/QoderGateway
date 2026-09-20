@@ -2,17 +2,20 @@ import asyncio
 import copy
 import json
 import os
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
 from . import encoding
 from .auth import SessionContext, bearer_headers
-from .env import httpx_client_kwargs
+from .env import httpx_client_kwargs, proxy_url
 
 
 QODER_CHAT_URL = "https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"
@@ -31,6 +34,13 @@ FIRST_TOKEN_TIMEOUT = float(os.getenv("QODER_FIRST_TOKEN_TIMEOUT", "60"))
 STREAM_READ_TIMEOUT = float(os.getenv("QODER_STREAM_READ_TIMEOUT", "120"))
 # 非流式总超时。
 TOTAL_TIMEOUT = float(os.getenv("QODER_TOTAL_TIMEOUT", "300"))
+# 上游连接池（共享 AsyncClient）：复用 TLS 连接，避免每请求新建 client 的握手/句柄 churn。
+HTTP_MAX_CONNECTIONS = int(os.getenv("QODER_HTTP_MAX_CONNECTIONS", "200"))
+HTTP_MAX_KEEPALIVE = int(os.getenv("QODER_HTTP_KEEPALIVE", "100"))
+# 单账号并发闸：同一账号同时在飞的上游请求上限（上游对单账号配额/并发有限）。
+ACCOUNT_CONCURRENCY = max(1, int(os.getenv("QODER_ACCOUNT_CONCURRENCY", "4")))
+# 拿不到账号槽位时的最长等待秒数（超时算临时错误，不轮换账号）。
+ACCOUNT_SLOT_WAIT = float(os.getenv("QODER_ACCOUNT_SLOT_WAIT", "30"))
 
 
 class UpstreamHangError(RuntimeError):
@@ -53,6 +63,8 @@ class UpstreamErrorFrame(RuntimeError):
 # 前 5 个为档位模型，后 7 个为 frontier 模型。仅用于 /v1/models 发现端点与
 # 前端 Playground 下拉提示；chat 请求的 model 仍为透传（不做硬校验）。
 QODER_MODELS: list[dict[str, str]] = [
+    # qfmodel：Qoder IDE（0.3.4+）默认模型 key，2026-09-20 抓包发现，不在 keirouter 目录中
+    {"id": "qfmodel", "name": "Qoder (IDE 默认)"},
     {"id": "auto", "name": "Auto"},
     {"id": "ultimate", "name": "Ultimate"},
     {"id": "performance", "name": "Performance"},
@@ -415,6 +427,111 @@ def build_new_protocol_body(req: dict[str, Any]) -> tuple[dict[str, Any], str, b
     return body, model, tools_enabled
 
 
+# ---------------------------------------------------------------- 共享 HTTP 客户端
+# httpx 0.28 的代理只能挂在 client 上（无按请求 proxy 参数），因此按“代理地址”
+# 缓存一组 client：相同代理的账号共享连接池，直连/全局代理各自一个池。
+_CLIENTS: dict[str, httpx.AsyncClient] = {}
+_CLIENT_INIT_LOCK = asyncio.Lock()
+
+
+def resolve_proxy(sess: SessionContext) -> str | None:
+    """账号级代理优先，未启用回退全局 .env（QODER_PROXY），再回退直连。
+
+    带账号密码时拼进 URL userinfo（httpx 代理认证只认 URL 形式），
+    用户名/密码做 URL 编码，避免特殊字符破坏 URL。
+    """
+    if getattr(sess, "proxy_enabled", False) and (sess.proxy_url or "").strip():
+        url = sess.proxy_url.strip()
+        user = (sess.proxy_username or "").strip()
+        pwd = sess.proxy_password or ""
+        if user:
+            scheme, _, rest = url.partition("://")
+            if rest:
+                creds = quote(user, safe="")
+                if pwd:
+                    creds = creds + ":" + quote(pwd, safe="")
+                return f"{scheme}://{creds}@{rest}"
+        return url
+    return proxy_url()
+
+
+async def client_for(sess: SessionContext) -> httpx.AsyncClient:
+    """按账号代理设置取（或创建）共享 client。"""
+    return await _client_for_proxy(resolve_proxy(sess))
+
+
+async def _client_for_proxy(proxy: str | None) -> httpx.AsyncClient:
+    key = proxy or ""
+    client = _CLIENTS.get(key)
+    if client is not None and not client.is_closed:
+        return client
+    async with _CLIENT_INIT_LOCK:
+        client = _CLIENTS.get(key)
+        if client is None or client.is_closed:
+            client = httpx.AsyncClient(
+                proxy=proxy or None,
+                timeout=httpx.Timeout(connect=15, read=STREAM_READ_TIMEOUT, write=60, pool=60),
+                limits=httpx.Limits(max_connections=HTTP_MAX_CONNECTIONS,
+                                    max_keepalive_connections=HTTP_MAX_KEEPALIVE,
+                                    keepalive_expiry=120.0),
+                **httpx_client_kwargs(),
+            )
+            _CLIENTS[key] = client
+        return client
+
+
+async def shared_client() -> httpx.AsyncClient:
+    """无账号上下文时的默认 client（全局 .env 代理或直连）。"""
+    return await _client_for_proxy(proxy_url())
+
+
+async def close_shared_client() -> None:
+    """应用关闭时释放全部连接池（lifespan shutdown 调用）。"""
+    async with _CLIENT_INIT_LOCK:
+        clients = list(_CLIENTS.values())
+        _CLIENTS.clear()
+    for c in clients:
+        if not c.is_closed:
+            try:
+                await c.aclose()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------- 单账号并发闸
+_ACCOUNT_SLOTS: dict[str, asyncio.Semaphore] = {}
+_SLOTS_LOCK = threading.Lock()
+
+
+def _account_semaphore(uid: str) -> asyncio.Semaphore:
+    with _SLOTS_LOCK:
+        sem = _ACCOUNT_SLOTS.get(uid)
+        if sem is None:
+            sem = asyncio.Semaphore(ACCOUNT_CONCURRENCY)
+            _ACCOUNT_SLOTS[uid] = sem
+        return sem
+
+
+class AccountSlotBusy(RuntimeError):
+    """等待账号并发槽位超时（临时性拥塞，不算账号错误，不轮换）。"""
+
+
+@asynccontextmanager
+async def account_slot(uid: str) -> AsyncIterator[None]:
+    """限制同一账号同时在飞的上游请求数，保护上游配额/降低 402 与挂起。"""
+    sem = _account_semaphore(uid)
+    try:
+        await asyncio.wait_for(sem.acquire(), timeout=ACCOUNT_SLOT_WAIT)
+    except asyncio.TimeoutError as exc:
+        raise AccountSlotBusy(
+            f"Account slot busy: no free slot for {uid} within {ACCOUNT_SLOT_WAIT:.0f}s"
+        ) from exc
+    try:
+        yield
+    finally:
+        sem.release()
+
+
 def raise_if_error_frame(line: str, model: str, account_uid: str) -> None:
     """老版协议错误帧检测：data 包裹的 body 是 {"code":..., "message":...} 而非 choices。
 
@@ -460,43 +577,42 @@ async def qoder_stream_lines(sess: SessionContext, body: dict[str, Any], model: 
     payload = encoding.encode(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode())
     headers = bearer_headers(sess, QODER_CHAT_URL, payload, "text/event-stream",
                              extra_headers={"X-Model-Key": model, "X-Model-Source": "system"})
-    timeout = httpx.Timeout(connect=15, read=STREAM_READ_TIMEOUT, write=60, pool=60)
-    async with httpx.AsyncClient(timeout=timeout, **httpx_client_kwargs()) as client:
-        async with client.stream("POST", QODER_CHAT_URL, content=payload, headers=headers) as response:
-            if response.status_code != 200:
-                text = await response.aread()
-                raise RuntimeError(f"HTTP {response.status_code} {text.decode(errors='replace')}")
-            line_iter = response.aiter_lines()
-            # 首字超时：老版协议对无配额模型 HTTP 200 后无限挂起（可能先吐空行/注释行充数），
-            # 只认非空、非 SSE 注释的行为"首字"。
-            first: str | None = None
-            deadline = time.monotonic() + FIRST_TOKEN_TIMEOUT
-            try:
-                while True:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    try:
-                        line = await asyncio.wait_for(line_iter.__anext__(), timeout=remaining)
-                    except StopAsyncIteration:
-                        return
-                    stripped = (line or "").strip()
-                    if stripped and not stripped.startswith(":"):
-                        raise_if_error_frame(line, model, sess.identity.uid)
-                        first = line
-                        break
-            except asyncio.TimeoutError:
-                first = None
-            if first is None:
-                raise UpstreamHangError(
-                    f"Upstream hang: no first token within {FIRST_TOKEN_TIMEOUT:.0f}s "
-                    f"(model={model}, account={sess.identity.uid})"
-                )
-            yield first
-            async for line in line_iter:
-                if line:
+    client = await client_for(sess)
+    async with client.stream("POST", QODER_CHAT_URL, content=payload, headers=headers) as response:
+        if response.status_code != 200:
+            text = await response.aread()
+            raise RuntimeError(f"HTTP {response.status_code} {text.decode(errors='replace')}")
+        line_iter = response.aiter_lines()
+        # 首字超时：老版协议对无配额模型 HTTP 200 后无限挂起（可能先吐空行/注释行充数），
+        # 只认非空、非 SSE 注释的行为"首字"。
+        first: str | None = None
+        deadline = time.monotonic() + FIRST_TOKEN_TIMEOUT
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    line = await asyncio.wait_for(line_iter.__anext__(), timeout=remaining)
+                except StopAsyncIteration:
+                    return
+                stripped = (line or "").strip()
+                if stripped and not stripped.startswith(":"):
                     raise_if_error_frame(line, model, sess.identity.uid)
-                    yield line
+                    first = line
+                    break
+        except asyncio.TimeoutError:
+            first = None
+        if first is None:
+            raise UpstreamHangError(
+                f"Upstream hang: no first token within {FIRST_TOKEN_TIMEOUT:.0f}s "
+                f"(model={model}, account={sess.identity.uid})"
+            )
+        yield first
+        async for line in line_iter:
+            if line:
+                raise_if_error_frame(line, model, sess.identity.uid)
+                yield line
 
 
 async def new_protocol_stream_lines(req: dict[str, Any], sess: SessionContext) -> AsyncIterator[str]:
@@ -511,14 +627,13 @@ async def new_protocol_stream_lines(req: dict[str, Any], sess: SessionContext) -
         "X-Request-ID": ctx.get("request_id", ""),
         "X-Session-ID": ctx.get("session_id", ""),
     }
-    async with httpx.AsyncClient(timeout=httpx.Timeout(TOTAL_TIMEOUT, connect=15), **httpx_client_kwargs()) as client:
-        async with client.stream("POST", QODER_CHAT_URL_NEW, json=body, headers=headers) as response:
-            if response.status_code != 200:
-                text = await response.aread()
-                raise RuntimeError(f"HTTP {response.status_code} {text.decode(errors='replace')}")
-            async for line in response.aiter_lines():
-                if line:
-                    yield line
+    async with (await client_for(sess)).stream("POST", QODER_CHAT_URL_NEW, json=body, headers=headers) as response:
+        if response.status_code != 200:
+            text = await response.aread()
+            raise RuntimeError(f"HTTP {response.status_code} {text.decode(errors='replace')}")
+        async for line in response.aiter_lines():
+            if line:
+                yield line
 
 
 async def stream_openai_response(req: dict[str, Any], sess: SessionContext) -> AsyncIterator[str]:
@@ -528,6 +643,13 @@ async def stream_openai_response(req: dict[str, Any], sess: SessionContext) -> A
     else:
         _, model, tools_enabled = build_new_protocol_body(req)
         lines = new_protocol_stream_lines(req, sess)
+    # 单账号并发闸：整个流式期间持槽（上游连接活着），防同一账号被打爆
+    async with account_slot(sess.identity.uid):
+        async for line in _stream_openai_chunks(lines, model, tools_enabled):
+            yield line
+
+
+async def _stream_openai_chunks(lines: AsyncIterator[str], model: str, tools_enabled: bool) -> AsyncIterator[str]:
     chunk_id = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
     tool_calls = ToolCallAccumulator()
@@ -539,7 +661,7 @@ async def stream_openai_response(req: dict[str, Any], sess: SessionContext) -> A
     def event(payload: dict[str, Any]) -> str:
         return f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
 
-    async for line in qoder_stream_lines(sess, body, model):
+    async for line in lines:
         if not line.startswith("data:"):
             continue
         delta = extract_delta(line[5:].strip())
@@ -611,14 +733,15 @@ async def complete_openai_response(req: dict[str, Any], sess: SessionContext) ->
     created = int(time.time())
     full = []
     tool_calls = ToolCallAccumulator()
-    async for line in lines:
-        if not line.startswith("data:"):
-            continue
-        delta = extract_delta(line[5:].strip())
-        if delta.content:
-            full.append(delta.content)
-        if delta.tool_calls:
-            tool_calls.append(delta.tool_calls)
+    async with account_slot(sess.identity.uid):
+        async for line in lines:
+            if not line.startswith("data:"):
+                continue
+            delta = extract_delta(line[5:].strip())
+            if delta.content:
+                full.append(delta.content)
+            if delta.tool_calls:
+                tool_calls.append(delta.tool_calls)
     content = "".join(full)
     fallback_tool_calls = None if tool_calls.calls or not tools_enabled else parse_tool_calls_text(content)
     message: dict[str, Any] = {"role": "assistant"}

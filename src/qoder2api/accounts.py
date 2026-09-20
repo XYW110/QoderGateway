@@ -1,6 +1,9 @@
 import copy
+import os
+import threading
 import time
 import uuid
+from dataclasses import replace
 from typing import Any
 
 from .auth import (
@@ -12,6 +15,38 @@ from .auth import (
     fetch_user_status
 )
 from .database import get_db
+
+
+# ---------------------------------------------------------------------------
+# 会话缓存：get_session_for_uid 每次都要同步读 sqlite + RSA/AES 构造 SessionContext，
+# 高并发下这是事件循环上的同步阻塞与 CPU 开销。按 uid 缓存 TTL 秒。
+# token 刷新（tokens.py）写库后调用 invalidate_session_cache(uid) 失效。
+# ---------------------------------------------------------------------------
+SESSION_CACHE_TTL = float(os.getenv("QODER_SESSION_CACHE_TTL", "60"))
+_SESSION_CACHE: dict[str, tuple[float, SessionContext]] = {}
+_SESSION_CACHE_LOCK = threading.Lock()
+
+
+def invalidate_session_cache(uid: str | None = None) -> None:
+    """失效会话缓存：传 uid 只失效该账号，否则全清（token 刷新后调用）。"""
+    with _SESSION_CACHE_LOCK:
+        if uid is None:
+            _SESSION_CACHE.clear()
+        else:
+            _SESSION_CACHE.pop(uid, None)
+
+
+def get_session_for_uid_cached(uid: str) -> SessionContext:
+    """带 TTL 的 get_session_for_uid；缓存未命中时才走数据库 + 签名构造。"""
+    now = time.monotonic()
+    with _SESSION_CACHE_LOCK:
+        hit = _SESSION_CACHE.get(uid)
+        if hit is not None and now - hit[0] < SESSION_CACHE_TTL:
+            return hit[1]
+    sess = get_session_for_uid(uid)
+    with _SESSION_CACHE_LOCK:
+        _SESSION_CACHE[uid] = (time.monotonic(), sess)
+    return sess
 
 
 def db_get_settings(key: str, default: str | None = None) -> str | None:
@@ -40,9 +75,47 @@ def db_load_accounts() -> dict[str, Any]:
             # 密码已落库，但默认不随接口下发（避免明文经 HTTP/前端日志外泄）；
             # 需要展示时改用 /ui/accounts?with_secrets=1 或直接查库
             account.pop("password", None)
+            # 代理密码同样不下发，只回“是否已设置”标志；用户名可回显便于编辑
+            account["proxy_password_set"] = bool(account.pop("proxy_password", None))
             accounts.append(account)
         active_uid = db_get_settings("active_uid")
         return {"accounts": accounts, "active_uid": active_uid}
+
+
+def set_account_proxy(uid: str, *, enabled: bool, url: str, username: str,
+                      password: str | None) -> dict[str, Any]:
+    """设置账号级代理。password 为 None/空串表示保留原密码不清空。
+
+    返回更新后的（脱敏）账号代理配置。
+    """
+    enabled_int = 1 if enabled else 0
+    url = (url or "").strip()
+    username = (username or "").strip()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT proxy_password FROM accounts WHERE uid = ?", (uid,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Account {uid} not found")
+        keep_pwd = row[0] or ""
+        new_pwd = keep_pwd if password is None or password == "" else password
+        conn.execute(
+            "UPDATE accounts SET proxy_enabled = ?, proxy_url = ?, proxy_username = ?, "
+            "proxy_password = ? WHERE uid = ?",
+            (enabled_int, url, username, new_pwd, uid),
+        )
+        after = conn.execute(
+            "SELECT proxy_enabled, proxy_url, proxy_username, proxy_password FROM accounts WHERE uid = ?",
+            (uid,),
+        ).fetchone()
+    invalidate_session_cache(uid)
+    return {
+        "uid": uid,
+        "proxy_enabled": bool(after[0]),
+        "proxy_url": after[1] or "",
+        "proxy_username": after[2] or "",
+        "proxy_password_set": bool(after[3]),
+    }
 
 
 async def import_current_auth() -> dict[str, Any]:
@@ -312,7 +385,15 @@ def _session_from_row(account: dict) -> SessionContext:
         refresh_token=account["refresh_token"],
     )
     _, machine_token, machine_type = new_machine()
-    return new_session(identity, account["machine_id"], machine_token, machine_type)
+    sess = new_session(identity, account["machine_id"], machine_token, machine_type)
+    # 挂上账号级代理配置（frozen dataclass，用 replace 复制）
+    return replace(
+        sess,
+        proxy_enabled=bool(account.get("proxy_enabled")),
+        proxy_url=account.get("proxy_url") or "",
+        proxy_username=account.get("proxy_username") or "",
+        proxy_password=account.get("proxy_password") or "",
+    )
 
 
 def enabled_uids() -> list[str]:

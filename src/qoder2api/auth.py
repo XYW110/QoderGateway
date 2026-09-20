@@ -48,6 +48,12 @@ class SessionContext:
     machine_id: str
     machine_token: str
     machine_type: str
+    # 账号级代理（可选）：proxy_enabled=True 且 proxy_url 非空时，该账号的上游
+    # 请求走此代理；账号/密码可为空（无认证代理）。默认关闭，回退全局 .env 代理。
+    proxy_enabled: bool = False
+    proxy_url: str = ""
+    proxy_username: str = ""
+    proxy_password: str = ""
 
 
 def new_machine() -> tuple[str, str, str]:

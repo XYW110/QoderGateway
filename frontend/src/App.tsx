@@ -12,6 +12,7 @@ interface Account {
   refresh_token: string; machine_id: string; enabled: boolean; last_status: string
   last_error: string | null; quota: number; is_quota_exceeded: boolean
   plan: string | null; user_tag: string | null; next_reset_at: number | null
+  proxy_enabled?: boolean; proxy_url?: string; proxy_username?: string; proxy_password_set?: boolean
 }
 interface AccountsConfig { accounts: Account[]; active_uid: string | null }
 interface UIStatus { ready: boolean; mode: string; username: string | null; uid: string | null; user_type: string | null; error: string | null; accounts_count: number }
@@ -320,6 +321,7 @@ function ToastContainer({ toasts, dismiss }: { toasts: ToastItem[]; dismiss: (id
 
 // Qoder 模型目录（与后端 bridge.QODER_MODELS 一致，参照 keirouter）
 const QODER_MODEL_OPTIONS: { value: string; label: string }[] = [
+  { value: 'qfmodel', label: 'Qoder（IDE 默认）' },
   { value: 'auto', label: 'Auto（自动）' },
   { value: 'ultimate', label: 'Ultimate（旗舰）' },
   { value: 'performance', label: 'Performance（性能）' },
@@ -388,6 +390,10 @@ export default function App() {
   const [regStarting, setRegStarting] = useState(false)
   const [regStopping, setRegStopping] = useState(false)
   const [regCount, setRegCount] = useState(2)
+  const [regTarget, setRegTarget] = useState(0)
+  const [regInterval, setRegInterval] = useState(20)
+  const [proxyEdit, setProxyEdit] = useState<{ uid: string; name: string; enabled: boolean; url: string; username: string; password: string; passwordSet: boolean } | null>(null)
+  const [proxySaving, setProxySaving] = useState(false)
 
   const switchLang = (next: Lang) => {
     setLang(next)
@@ -553,17 +559,20 @@ export default function App() {
       const resp = await authedFetch('/ui/registrar/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ parents: regCount }),
+        body: JSON.stringify({ parents: regCount, target_success: regTarget, batch_interval: regInterval }),
       })
       const data = await resp.json()
       if (data.ok) {
-        pushToast('INFO', lang === 'zh' ? '注册已开始（无限循环）' : 'Registration started (looping)', lang === 'zh' ? `${data.parents} 个母线程，每个 3 子任务并发，请完成置顶的人机验证` : `${data.parents} parent threads x 3 workers, complete the topmost human verification`)
+        const targetMsg = data.target_success
+          ? (lang === 'zh' ? `，目标成功 ${data.target_success} 个后自动停` : `, auto-stop after ${data.target_success} successes`)
+          : (lang === 'zh' ? '，不限总数' : ', unlimited')
+        pushToast('INFO', lang === 'zh' ? '注册已开始' : 'Registration started', lang === 'zh' ? `${data.parents} 个母线程 × 3 子任务，批间隔 ${data.batch_interval}s${targetMsg}` : `${data.parents} parents x 3 workers, batch interval ${data.batch_interval}s${targetMsg}`)
         fetchRegStatus()
       } else {
         pushToast('ERROR', lang === 'zh' ? '启动失败' : 'Start failed', data.error || '')
       }
     } catch { pushToast('ERROR', lang === 'zh' ? '启动失败' : 'Start failed', '') } finally { setRegStarting(false) }
-  }, [authedFetch, fetchRegStatus, pushToast, regStatus?.running, lang, regCount])
+  }, [authedFetch, fetchRegStatus, pushToast, regStatus?.running, lang, regCount, regTarget, regInterval])
 
   const stopRegister = useCallback(async () => {
     if (!regStatus?.running || regStopping) return
@@ -697,6 +706,43 @@ export default function App() {
       pushToast('SUCCESS', lang === 'zh' ? '账号已删除' : 'Account Deleted', msg.deleted(uid))
       fetchAccounts(); fetchStatus(); fetchLogs()
     } catch (err: any) { pushToast('ERROR', msg.deleteFailed, err.message) }
+  }
+
+  const openProxyEditor = (acc: Account) => {
+    setProxyEdit({
+      uid: acc.uid, name: acc.name,
+      enabled: !!acc.proxy_enabled,
+      url: acc.proxy_url || '',
+      username: acc.proxy_username || '',
+      password: '', passwordSet: !!acc.proxy_password_set,
+    })
+  }
+
+  const handleSaveProxy = async () => {
+    if (!proxyEdit) return
+    setProxySaving(true)
+    try {
+      const body: Record<string, unknown> = {
+        uid: proxyEdit.uid,
+        proxy_enabled: proxyEdit.enabled,
+        proxy_url: proxyEdit.url.trim(),
+        proxy_username: proxyEdit.username.trim(),
+      }
+      // 密码留空 = 保留原密码；只有真输入了才提交
+      if (proxyEdit.password !== '') body.proxy_password = proxyEdit.password
+      const resp = await authedFetch('/ui/accounts/proxy', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const data = await resp.json()
+      if (!resp.ok || !data.ok) throw new Error(data.detail || 'Save failed')
+      pushToast('SUCCESS', lang === 'zh' ? '代理设置已保存' : 'Proxy settings saved',
+        lang === 'zh' ? `${proxyEdit.name}${proxyEdit.enabled ? ' → ' + (proxyEdit.url || '直连') : ' → 未启用代理'}` : `${proxyEdit.name}`)
+      setProxyEdit(null)
+      fetchAccounts()
+    } catch (err: any) {
+      pushToast('ERROR', lang === 'zh' ? '保存失败' : 'Save failed', err.message)
+    } finally { setProxySaving(false) }
   }
 
   // 只提交 auth_required：allowed_keys 由专用接口维护，
@@ -1100,6 +1146,52 @@ export default function App() {
                 </section>
               )}
 
+              {proxyEdit && (
+                <section className="bg-surface-card border border-hairline rounded-2xl p-6">
+                  <div className="flex items-center gap-2 mb-4">
+                    <span className="material-symbols-outlined text-[18px] text-body">vpn_lock</span>
+                    <span className="text-sm font-semibold text-ink">
+                      {lang === 'zh' ? '账号代理设置' : 'Account Proxy'} — <span className="font-mono">{proxyEdit.name}</span>
+                    </span>
+                  </div>
+                  <div className="space-y-4">
+                    <label className="flex items-center gap-3 cursor-pointer select-none">
+                      <button
+                        onClick={() => setProxyEdit({ ...proxyEdit, enabled: !proxyEdit.enabled })}
+                        className={`w-11 h-6 rounded-full p-0.5 transition-colors relative ${proxyEdit.enabled ? 'bg-ink' : 'bg-hairline-strong'}`}
+                      >
+                        <div className={`w-5 h-5 bg-white rounded-full transition-transform duration-200 ${proxyEdit.enabled ? 'translate-x-5' : 'translate-x-0'}`}></div>
+                      </button>
+                      <span className="text-sm font-semibold text-ink">{lang === 'zh' ? '启用代理' : 'Enable proxy'}</span>
+                      <span className="text-[11px] text-body">{lang === 'zh' ? '关闭时回退 .env 全局代理或直连' : 'Falls back to .env global proxy or direct'}</span>
+                    </label>
+                    <div>
+                      <label className="text-[12px] font-semibold text-body mb-2 block uppercase tracking-widest">{lang === 'zh' ? '代理地址' : 'Proxy URL'}</label>
+                      <CustomInput value={proxyEdit.url} onChange={v => setProxyEdit({ ...proxyEdit, url: v })} placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:7891" className="!py-3 !rounded-xl !bg-white/60" />
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div>
+                        <label className="text-[12px] font-semibold text-body mb-2 block uppercase tracking-widest">{lang === 'zh' ? '代理账号（可空）' : 'Proxy user (optional)'}</label>
+                        <CustomInput value={proxyEdit.username} onChange={v => setProxyEdit({ ...proxyEdit, username: v })} placeholder="user" className="!py-3 !rounded-xl !bg-white/60" />
+                      </div>
+                      <div>
+                        <label className="text-[12px] font-semibold text-body mb-2 block uppercase tracking-widest">
+                          {lang === 'zh' ? '代理密码（可空）' : 'Proxy password (optional)'}
+                          {proxyEdit.passwordSet && <span className="ml-2 text-mint">{lang === 'zh' ? '已设置' : 'set'}</span>}
+                        </label>
+                        <CustomInput value={proxyEdit.password} onChange={v => setProxyEdit({ ...proxyEdit, password: v })} placeholder={proxyEdit.passwordSet ? (lang === 'zh' ? '留空 = 保持不变' : 'empty = keep') : 'password'} className="!py-3 !rounded-xl !bg-white/60" />
+                      </div>
+                    </div>
+                    <div className="flex gap-3 pt-1">
+                      <button onClick={handleSaveProxy} disabled={proxySaving} className="bg-ink text-white font-bold px-6 py-2.5 rounded-lg text-sm transition-all hover:bg-neutral-800 disabled:opacity-50">
+                        {proxySaving ? (lang === 'zh' ? '保存中...' : 'Saving...') : (lang === 'zh' ? '保存' : 'Save')}
+                      </button>
+                      <button onClick={() => setProxyEdit(null)} className="px-4 py-2.5 text-body border border-hairline rounded-lg text-sm font-bold hover:text-ink">{lang === 'zh' ? '取消' : 'Cancel'}</button>
+                    </div>
+                  </div>
+                </section>
+              )}
+
               {quotaList && (
                 <section className="bg-surface-card border border-hairline rounded-2xl overflow-hidden">
                   <div className="px-6 py-4 border-b border-hairline flex items-center gap-2">
@@ -1149,13 +1241,13 @@ export default function App() {
                 <div className="overflow-x-auto">
                   <table className="w-full text-left">
                     <thead className="bg-canvas-soft border-b border-hairline">
-                      <tr>{['Account', 'UID', 'Plan / Quota', 'Status', 'Reset', 'Enabled', 'Actions'].map((h, i) => (
+                      <tr>{['Account', 'UID', 'Plan / Quota', 'Status', 'Reset', 'Enabled', 'Proxy', 'Actions'].map((h, i) => (
                         <th key={i} className={`px-6 py-4 text-[10px] font-semibold text-body uppercase tracking-wider ${i === 5 ? 'text-center' : ''}`}>{h}</th>
                       ))}</tr>
                     </thead>
                     <tbody className="divide-y divide-hairline">
                       {accountsConfig.accounts.length === 0 ? (
-                        <tr><td colSpan={7} className="py-8 text-center text-xs text-body font-medium">{t.accounts.empty}</td></tr>
+                        <tr><td colSpan={8} className="py-8 text-center text-xs text-body font-medium">{t.accounts.empty}</td></tr>
                       ) : accountsConfig.accounts
                         .filter(acc => !searchAccounts || acc.name.toLowerCase().includes(searchAccounts.toLowerCase()) || acc.uid.includes(searchAccounts))
                         .map((acc) => {
@@ -1176,12 +1268,20 @@ export default function App() {
                                   <div className={`w-5 h-5 bg-white rounded-full transition-transform duration-200 ${acc.enabled ? 'translate-x-5' : 'translate-x-0'}`}></div>
                                 </button>
                               </td>
-                              <td className="px-6 py-5 text-right">
-                                <div className="flex items-center justify-end gap-4 opacity-0 group-hover:opacity-100 transition-opacity">
-                                  <button onClick={() => handleSelectAccount(acc.uid)} disabled={isActive || !acc.enabled} className="text-body hover:text-ink disabled:opacity-30" title="Activate"><span className="material-symbols-outlined">play_circle</span></button>
-                                  <button onClick={() => handleDeleteAccount(acc.uid)} className="text-body hover:text-red-600" title="Delete"><span className="material-symbols-outlined">delete</span></button>
-                                </div>
-                              </td>
+                               <td className="px-6 py-5">
+                                 {acc.proxy_enabled ? (
+                                   <span className="px-2 py-1 text-[10px] font-bold rounded-full bg-mint/20 text-ink font-mono" title={acc.proxy_url || ''}>{acc.proxy_url || (lang === 'zh' ? '已启用' : 'ON')}</span>
+                                 ) : (
+                                   <span className="text-[10px] text-body font-mono">--</span>
+                                 )}
+                               </td>
+                               <td className="px-6 py-5 text-right">
+                                 <div className="flex items-center justify-end gap-4 opacity-0 group-hover:opacity-100 transition-opacity">
+                                   <button onClick={() => openProxyEditor(acc)} className="text-body hover:text-ink" title={lang === 'zh' ? '代理设置' : 'Proxy settings'}><span className="material-symbols-outlined">vpn_lock</span></button>
+                                   <button onClick={() => handleSelectAccount(acc.uid)} disabled={isActive || !acc.enabled} className="text-body hover:text-ink disabled:opacity-30" title="Activate"><span className="material-symbols-outlined">play_circle</span></button>
+                                   <button onClick={() => handleDeleteAccount(acc.uid)} className="text-body hover:text-red-600" title="Delete"><span className="material-symbols-outlined">delete</span></button>
+                                 </div>
+                               </td>
                             </tr>
                           )
                         })}
@@ -1431,6 +1531,31 @@ export default function App() {
                         >{n}</button>
                       ))}
                     </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-semibold text-ink">{lang === 'zh' ? '目标成功数' : 'Target'}</span>
+                    <input
+                      type="number"
+                      min={0}
+                      value={regTarget}
+                      onChange={e => setRegTarget(Math.max(0, parseInt(e.target.value) || 0))}
+                      disabled={regStatus?.running}
+                      title={lang === 'zh' ? '0 = 不限，达到后当前批次结束自动停' : '0 = unlimited; auto-stops at batch boundary when reached'}
+                      className="w-20 h-11 px-3 bg-white border border-hairline rounded-xl text-sm font-bold text-ink outline-none focus:border-ink disabled:opacity-50"
+                    />
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-semibold text-ink">{lang === 'zh' ? '批间隔(s)' : 'Interval(s)'}</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={3600}
+                      value={regInterval}
+                      onChange={e => setRegInterval(Math.min(3600, Math.max(0, parseInt(e.target.value) || 0)))}
+                      disabled={regStatus?.running}
+                      title={lang === 'zh' ? '同一母线程两批之间的等待秒数' : 'Seconds between batches of the same parent thread'}
+                      className="w-20 h-11 px-3 bg-white border border-hairline rounded-xl text-sm font-bold text-ink outline-none focus:border-ink disabled:opacity-50"
+                    />
                   </div>
                   {regStatus?.running ? (
                     <button

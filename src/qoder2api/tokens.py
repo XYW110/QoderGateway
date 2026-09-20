@@ -65,10 +65,16 @@ def refresh_one_account(uid: str) -> dict[str, Any]:
 
     with get_db() as conn:
         conn.execute(
-            "UPDATE accounts SET security_oauth_token = ?, refresh_token = ?, "
+            "UPDATE accounts SET security_oauth_token = *, refresh_token = *, "
             "token_expires_at = ?, last_status = 'ok', last_error = NULL WHERE uid = ?",
             (new_tok, new_rt, expires_at, uid),
         )
+    # token 已换新：失效该账号的会话缓存，避免继续用旧 token 签名
+    try:
+        from .accounts import invalidate_session_cache
+        invalidate_session_cache(uid)
+    except Exception:
+        pass
     return {"ok": True, "uid": uid, "name": row["name"], "expires_at": expires_at}
 
 

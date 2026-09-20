@@ -31,7 +31,7 @@ import httpx
 
 from .accounts import db_get_settings, db_set_settings
 from .database import get_db
-from .env import httpx_client_kwargs, load_dotenv, project_root
+from .env import httpx_client_kwargs, load_dotenv, mail_proxy, project_root
 from .mail_backend import create_mailbox as _mail_create, wait_code as _mail_wait
 
 # ---------------------------------------------------------------------------
@@ -49,11 +49,19 @@ _REGISTRAR: dict[str, Any] = {
     "stop_requested": False,
     "parents": 0,
     "started_at": None,
+    "target_success": 0,     # 目标成功数，0=不限；达到后母线程在批次边界自动停
+    "batch_interval": 20,    # 同一母线程两批之间的间隔（秒），给上游/邮箱留喘息
     "active": {},   # 运行中的子任务
     "recent": {},   # 最近完成的子任务（最多 30 个）
     "stats": {"success": 0, "failed": 0, "total": 0},
 }
 _LOCK = threading.Lock()
+
+# 滑块自动求解互斥锁：求解过程对时效极端敏感（CDP 鼠标事件闭环 + 每步 30-60ms
+# 精修 + 0.25px 容差，locate_gap 又是 CPU 密集），并发求解会因 CPU 争抢与鼠标事件
+# 排队导致斜率观测失真、残差超标被阿里云判失败（实测 3 并发时常 1 成功 2 失败）。
+# 故自动求解全局串行；人工验证阶段本就由 VerifierQueue 串行，无需此锁。
+_SLIDE_LOCK = threading.Lock()
 
 
 def _log(task_id: str | None, line: str) -> None:
@@ -218,6 +226,7 @@ def yyds_create_mailbox(prefix: str = "qoder", task_id: str | None = None, domai
             headers={"X-API-Key": key, "Content-Type": "application/json"},
             json=payload,
             timeout=20,
+            proxy=mail_proxy(),
         )
         if r.status_code in (200, 201):
             address = r.json()["data"]["address"]
@@ -254,6 +263,7 @@ def yyds_wait_code(address: str, task_id: str | None = None, timeout: float = 12
                 params={"address": address, "wait": 30},
                 headers={"X-API-Key": key},
                 timeout=45,
+                proxy=mail_proxy(),
             )
             if r.status_code == 200:
                 msg = r.json()["data"]["message"]
@@ -342,12 +352,42 @@ def _pick_button(features: list[dict[str, Any]]) -> dict[str, Any] | None:
     return best if _score_button(best) >= 50 else None
 
 
+_USED_PORTS: set[int] = set()
+_PORT_LOCK = threading.Lock()
+_PORT_RANGE = (20000, 40000)  # 专用调试端口区间，避开系统临时端口段，降低冲突概率
+
+
 def _free_port() -> int:
-    """分配空闲端口：每个浏览器实例独立调试端口，防止多实例复用一个浏览器。"""
+    """分配空闲调试端口。
+
+    旧实现用 bind(0) 让系统分配临时端口后关闭 socket——存在竞态：
+    ① 端口关闭到 chrome 真正绑定之间，另一个任务的 bind(0) 可能拿到同一端口；
+    ② 系统也可能把该端口立刻分配给别的进程。
+    多母线程 × 批内并发下表现为后启动的 chrome 绑定调试端口失败即退出，
+    DrissionPage 连接不到 → BrowserConnectError。
+    改为固定区间随机 + 已用集合去重（持锁），从根上杜绝同端口双实例。
+    """
     import socket
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    with _PORT_LOCK:
+        for _ in range(300):
+            port = random.randint(*_PORT_RANGE)
+            if port in _USED_PORTS:
+                continue
+            with socket.socket() as s:
+                try:
+                    s.bind(("127.0.0.1", port))
+                except OSError:
+                    continue
+            _USED_PORTS.add(port)
+            return port
+    raise RuntimeError("No free debug port available in range 20000-40000")
+
+
+def _release_port(port: int | None) -> None:
+    if not port:
+        return
+    with _PORT_LOCK:
+        _USED_PORTS.discard(port)
 
 
 # ---------------------------------------------------------------------------
@@ -356,25 +396,44 @@ def _free_port() -> int:
 class RegistrarBot:
     def __init__(self, task_id: str = "t1", verifier_queue: VerifierQueue | None = None,
                  profile_dir: str | None = None, cleanup_profile: bool = False,
-                 proxy: str | None = None) -> None:
-        from DrissionPage import ChromiumOptions, ChromiumPage
+                 proxy: str | None = None, launch_retries: int = 3) -> None:
+        from DrissionPage import ChromiumOptions, ChromiumPage  # 延迟导入，降低网关启动开销
 
         self.task_id = task_id
         self.vq = verifier_queue or _VQ
         self.proxy = proxy
-        co = ChromiumOptions()
-        co.set_local_port(_free_port())  # 独立调试端口，杜绝实例串扰
-        if proxy:
-            co.set_proxy(proxy)
-            _log(task_id, f"[browser] using proxy {proxy[:48]}...")
-        if profile_dir:
-            self.profile_dir = profile_dir
-        else:
-            self.profile_dir = tempfile.mkdtemp(prefix=f"qoder_reg_{task_id[:8]}_")
-            _log(task_id, f"[browser] new temp profile: {self.profile_dir}")
-        self._cleanup_profile = cleanup_profile
-        co.set_user_data_path(self.profile_dir)
-        self.page = ChromiumPage(co)
+        self._port: int | None = None
+        last_exc: Exception | None = None
+        for attempt in range(1, max(1, launch_retries) + 1):
+            # 每次尝试都换新端口；临时 profile 也重建，避免上次失败残留的
+            # Singleton 锁导致 chrome 启动即退出
+            if profile_dir:
+                self.profile_dir = profile_dir
+            else:
+                self.profile_dir = tempfile.mkdtemp(prefix=f"qoder_reg_{task_id[:8]}_")
+            port = _free_port()
+            try:
+                co = ChromiumOptions()
+                co.set_local_port(port)  # 独立调试端口，杜绝实例串扰
+                if proxy:
+                    co.set_proxy(proxy)
+                    _log(task_id, f"[browser] using proxy {proxy[:48]}...")
+                co.set_user_data_path(self.profile_dir)
+                _log(task_id, f"[browser] launch attempt {attempt}: port={port} profile={self.profile_dir}")
+                self.page = ChromiumPage(co)
+                self._port = port
+                self._cleanup_profile = cleanup_profile
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                _log(task_id, f"[browser] launch attempt {attempt} FAILED: {type(exc).__name__}: {exc}")
+                _release_port(port)
+                # 清理本次尝试的临时 profile，防止下次启动被旧锁挡住
+                if not profile_dir:
+                    shutil.rmtree(self.profile_dir, ignore_errors=True)
+                if attempt < launch_retries:
+                    time.sleep(2 * attempt)
+        raise RuntimeError(f"Browser launch failed after {launch_retries} attempts: {last_exc}")
 
     # ---- 窗口控制（平时隐藏后台，人机验证置顶一次） ----
     def window_hide(self) -> None:
@@ -460,6 +519,8 @@ class RegistrarBot:
             self.page.quit()
         except Exception:
             pass
+        _release_port(self._port)
+        self._port = None
         if self._cleanup_profile:
             try:
                 shutil.rmtree(self.profile_dir, ignore_errors=True)
@@ -661,36 +722,41 @@ class RegistrarBot:
             if _slider_solve:
                 # 阶段1：窗口保持最小化（不打扰用户）先试；
                 # 阶段2：若疑似被渲染节流（挂载失败/拼图不动）→ 置顶后再试。
-                for phase in ("hidden", "visible"):
-                    if _REGISTRAR["stop_requested"]:
-                        raise RuntimeError("用户请求停止注册")
-                    if phase == "visible":
-                        self.window_show_top()
-                    try:
-                        _res = _slider_solve(
-                            page,
-                            dump_dir=str(dump_root / phase),
-                            rounds=1 if phase == "hidden" else 3,
-                            open_timeout=25.0 if phase == "hidden" else 45.0,
-                        )
-                    except Exception as e:  # noqa: BLE001
-                        _res = {"ok": False, "reason": f"{type(e).__name__}: {e}"}
-                    _last = (_res.get("log") or [{}])[-1]
-                    _judge = (_res.get("judge") or (_last.get("judge") or {}))
-                    _err = _last.get("error")
-                    _log(tid, "[slider] %s auto: ok=%s reason=%s round=%s gap=%s err=%s "
-                              "drag=%s judge=%s weak=%s" % (
-                                  phase, _res.get("ok"), _res.get("reason"), _res.get("round"),
-                                  (_res.get("gap") or _last.get("gap") or {}).get("gap_x"),
-                                  _err, _res.get("drag") or _last.get("drag"),
-                                  {k: _judge.get(k) for k in
-                                   ("pass", "reason", "startText", "cls", "text", "popup_w")},
-                                  _res.get("weak")))
-                    if _res.get("ok"):
-                        auto_ok = True
-                        break
-                    if phase == "hidden":
-                        self.window_hide()
+                # 整个自动求解持 _SLIDE_LOCK 串行：并发下 CDP 鼠标事件排队 + CPU 争抢
+                # 会让闭环拖动的斜率观测失真，残差超出阿里云 0.25px 容差即判失败。
+                with _SLIDE_LOCK:
+                    _log(tid, "[slider] acquired solve lock (serialized)")
+                    for phase in ("hidden", "visible"):
+                        if _REGISTRAR["stop_requested"]:
+                            raise RuntimeError("用户请求停止注册")
+                        if phase == "visible":
+                            self.window_show_top()
+                        try:
+                            _res = _slider_solve(
+                                page,
+                                dump_dir=str(dump_root / phase),
+                                rounds=1 if phase == "hidden" else 3,
+                                open_timeout=25.0 if phase == "hidden" else 45.0,
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            _res = {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+                        _last = (_res.get("log") or [{}])[-1]
+                        _judge = (_res.get("judge") or (_last.get("judge") or {}))
+                        _err = _last.get("error")
+                        _log(tid, "[slider] %s auto: ok=%s reason=%s round=%s gap=%s err=%s "
+                                  "drag=%s judge=%s weak=%s" % (
+                                      phase, _res.get("ok"), _res.get("reason"), _res.get("round"),
+                                      (_res.get("gap") or _last.get("gap") or {}).get("gap_x"),
+                                      _err, _res.get("drag") or _last.get("drag"),
+                                      {k: _judge.get(k) for k in
+                                       ("pass", "reason", "startText", "cls", "text", "popup_w")},
+                                      _res.get("weak")))
+                        if _res.get("ok"):
+                            auto_ok = True
+                            break
+                        if phase == "hidden":
+                            self.window_hide()
+                    _log(tid, "[slider] released solve lock")
         if auto_ok:
             self.window_hide()
             _log(tid, "[slider] 自动求解通过 ✔")
@@ -846,6 +912,8 @@ def get_registrar_status() -> dict[str, Any]:
             "stop_requested": _REGISTRAR["stop_requested"],
             "parents": _REGISTRAR["parents"],
             "started_at": _REGISTRAR["started_at"],
+            "target_success": _REGISTRAR["target_success"],
+            "batch_interval": _REGISTRAR["batch_interval"],
             "verification": _VQ.current,
             "stats": dict(_REGISTRAR["stats"]),
             "active": {tid: _dump(t) for tid, t in _REGISTRAR["active"].items()},
@@ -853,24 +921,40 @@ def get_registrar_status() -> dict[str, Any]:
         }
 
 
-def start_registration(parents: int = 2) -> dict[str, Any]:
-    """启动 parents 个母线程；每个母线程无限循环：每批并发 3 个子任务，直到 stop_registration()。"""
+def start_registration(parents: int = 2, target_success: int = 0, batch_interval: float = 20) -> dict[str, Any]:
+    """启动 parents 个母线程；每个母线程循环：每批并发 3 个子任务，批间休眠 batch_interval 秒。
+
+    target_success > 0 时，累计成功数达到目标即令所有母线程在批次边界停止
+    （正在跑的子任务跑完当前批次，不半路掐断）；0 = 不限，只能手动停。
+    """
     parents = max(1, min(int(parents), 6))
+    try:
+        target_success = max(0, int(target_success))
+    except (TypeError, ValueError):
+        target_success = 0
+    try:
+        batch_interval = min(3600.0, max(0.0, float(batch_interval)))
+    except (TypeError, ValueError):
+        batch_interval = 20.0
     with _LOCK:
         if _REGISTRAR["running"]:
             return {"ok": False, "error": "已有注册任务在运行"}
         _REGISTRAR["running"] = True
         _REGISTRAR["stop_requested"] = False
         _REGISTRAR["parents"] = parents
+        _REGISTRAR["target_success"] = target_success
+        _REGISTRAR["batch_interval"] = batch_interval
         _REGISTRAR["active"] = {}
         _REGISTRAR["recent"] = {}
         _REGISTRAR["stats"] = {"success": 0, "failed": 0, "total": 0}
         _REGISTRAR["started_at"] = time.time()
     for i in range(parents):
         pid = f"P{i + 1}"
-        _log("sched", f"启动母线程 {pid}（每批 3 个子任务，无限循环）")
+        _log("sched", f"启动母线程 {pid}（每批 3 个子任务，批间隔 {batch_interval:.0f}s，"
+                      f"目标成功数 {'不限' if not target_success else target_success}）")
         threading.Thread(target=_run_parent, args=(pid,), daemon=True).start()
-    return {"ok": True, "parents": parents}
+    return {"ok": True, "parents": parents, "target_success": target_success,
+            "batch_interval": batch_interval}
 
 
 def stop_registration() -> dict[str, Any]:
@@ -883,8 +967,31 @@ def stop_registration() -> dict[str, Any]:
     return {"ok": True}
 
 
+def _target_reached() -> bool:
+    """目标成功数是否已达到（target=0 表示不限，永不为真）。"""
+    target = _REGISTRAR["target_success"]
+    return bool(target) and _REGISTRAR["stats"]["success"] >= target
+
+
+def _maybe_stop_on_target(parent_id: str) -> bool:
+    """达到目标成功数时置 stop_requested（只日志一次）。返回是否已请求停止。"""
+    if not _target_reached() or _REGISTRAR["stop_requested"]:
+        return _REGISTRAR["stop_requested"]
+    with _LOCK:
+        if _REGISTRAR["stop_requested"]:
+            return True
+        _REGISTRAR["stop_requested"] = True
+    _log(parent_id, f"已达到目标成功数 {_REGISTRAR['target_success']}，"
+                    f"本批次结束后停止（统计: 成功 {_REGISTRAR['stats']['success']}）")
+    return True
+
+
 def _run_parent(parent_id: str, workers: int = 3) -> None:
-    """母线程：无限循环启动批次，每批 workers 个子任务并发；stop_requested 时停止。"""
+    """母线程：循环启动批次，每批 workers 个子任务并发；批间休眠 batch_interval 秒。
+
+    停止条件：stop_registration() 手动停止，或累计成功数达到 target_success。
+    批次间隔可被停止请求打断（分段 sleep，及时响应）。
+    """
     batch = 0
     try:
         while not _REGISTRAR["stop_requested"]:
@@ -901,7 +1008,15 @@ def _run_parent(parent_id: str, workers: int = 3) -> None:
             for t in threads:
                 t.join()
             _log(parent_id, f"批次 {batch} 完成")
-        _log(parent_id, "母线程停止（用户请求）")
+            if _maybe_stop_on_target(parent_id):
+                break
+            interval = float(_REGISTRAR["batch_interval"] or 0)
+            waited = 0.0
+            while waited < interval and not _REGISTRAR["stop_requested"]:
+                time.sleep(min(1.0, interval - waited))
+                waited += 1.0
+        reason = "已达到目标成功数" if _target_reached() else "用户请求"
+        _log(parent_id, f"母线程停止（{reason}）")
     finally:
         with _LOCK:
             if _REGISTRAR["running"] and not _REGISTRAR["active"]:
@@ -910,18 +1025,28 @@ def _run_parent(parent_id: str, workers: int = 3) -> None:
         _log("sched", f"全部停止。本次共注册 {stats.get('success', 0)} 个账户（失败 {stats.get('failed', 0)}）")
 
 
+def _registrar_proxy() -> str | None:
+    """注册机浏览器代理：读 .env（QODER_REGISTRAR_PROXY / QODER_REGISTRAR_PROXY_URL）。"""
+    from .env import registrar_proxy
+    if os.environ.get("QODER_REGISTRAR_PROXY", "").strip().lower() in {"1", "true", "yes", "on"} \
+            and not (os.environ.get("QODER_REGISTRAR_PROXY_URL") or os.environ.get("QODER_PROXY") or "").strip():
+        _log("sched", "[browser] QODER_REGISTRAR_PROXY 已开启但未配置地址，注册机直连")
+    return registrar_proxy()
+
+
 def _run_one(task_id: str) -> None:
     reg: RegistrarBot | None = None
+    proxy = _registrar_proxy()
     try:
         _set_task(task_id, "registering")
-        reg = RegistrarBot(task_id=task_id, cleanup_profile=False)
+        reg = RegistrarBot(task_id=task_id, cleanup_profile=False, proxy=proxy)
         acct = reg.register()
         reg.close()
         profile = reg.profile_dir
         _log(task_id, "[registrar] register done")
 
         _set_task(task_id, "device_auth")
-        dev = RegistrarBot(task_id=task_id, profile_dir=profile, cleanup_profile=True)
+        dev = RegistrarBot(task_id=task_id, profile_dir=profile, cleanup_profile=True, proxy=proxy)
         try:
             cred = dev.device()
         finally:

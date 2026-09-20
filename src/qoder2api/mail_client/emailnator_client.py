@@ -36,11 +36,16 @@ import httpx
 BASE = "https://www.emailnator.com"
 
 
-def _default_proxy() -> str:
-    """代理运行时从环境变量读取（.env 由 qoder2api.env 在导入期加载）：
-    LOCAL_PROXY > QODER_PROXY > 默认 Clash 7897。"""
-    return (os.environ.get("LOCAL_PROXY") or os.environ.get("QODER_PROXY")
-            or "http://127.0.0.1:7897").strip()
+def _default_proxy() -> str | None:
+    """邮箱客户端代理（实时读 .env，由 qoder2api.env 在导入期加载）：
+
+    QODER_MAIL_PROXY=0/false      → None（直连，关代理）
+    QODER_MAIL_PROXY_URL          → 优先
+    LOCAL_PROXY / QODER_PROXY     → 回退
+    都未配置                       → 默认 Clash http://127.0.0.1:7897（裸 IP 直连会被拦截）
+    """
+    from ..env import mail_proxy
+    return mail_proxy() or "http://127.0.0.1:7897"
 
 
 # 兼容旧引用（模块导入期的快照；客户端默认代理以 _default_proxy() 实时读取为准）
@@ -61,10 +66,10 @@ class EmailnatorClient:
     """Emailnator 官方内部 API 客户端（httpx，走本地 Clash 代理）。"""
 
     def __init__(self, proxy: str | None = None, timeout: float = 25.0):
-        # 默认走 _default_proxy()（.env 的 LOCAL_PROXY/QODER_PROXY），
-        # Emailnator 裸 IP 直连会被拦截
+        # 默认走 _default_proxy()（.env 的 QODER_MAIL_PROXY* / LOCAL_PROXY / QODER_PROXY），
+        # Emailnator 裸 IP 直连会被拦截；显式传 None 也表示用默认。
         self._client = httpx.Client(
-            proxy=proxy or _default_proxy(),
+            proxy=proxy if proxy is not None else _default_proxy(),
             timeout=timeout,
             headers={
                 "User-Agent": UA,

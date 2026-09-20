@@ -268,3 +268,40 @@ const _$d = (s, k = "syJkkdK5Dxwd") => {
 | frontier 模型 | `qmodel` / `qmodel_latest` / `dmodel` / `dfmodel` / `gm51model` / `kmodel` / `mmodel` |
 
 > 注：`qfmodel`（IDE 默认）**不在**上述目录中——它不在 keirouter 的清单里，是 2026-09-20 抓包新发现的 key。若要支持 IDE 默认档位，需把它补进 `QODER_MODELS`。
+
+---
+
+## 12. 账号级代理（2026-09-21 落地）
+
+每个账号可单独配置上游代理，控制台账号池逐账号编辑（`vpn_lock` 按钮）。
+
+| 字段 | 列 | 说明 |
+|---|---|---|
+| 启用代理 | `accounts.proxy_enabled` | 1=走自己的代理；0=回退全局 |
+| 代理地址 | `accounts.proxy_url` | `http://` / `socks5://` |
+| 代理账号 | `accounts.proxy_username` | 可空 |
+| 代理密码 | `accounts.proxy_password` | 可空；**接口不回显**，只回 `proxy_password_set` 标志；保存时留空=保留原值 |
+
+**优先级**：账号启用且有地址 → 账号代理；否则 → `.env` 的 `QODER_PROXY`；再否则 → 直连。
+带账号密码时拼成 URL userinfo（`http://user:pass@host:port`，user/pass 做 URL 编码），因为 httpx 的代理认证只认 URL 形式。
+
+**实现要点**：
+- httpx 0.28 **没有按请求传代理的参数**，代理只能挂在 client 上 → `bridge.py` 按“代理地址”缓存一组 `AsyncClient`（相同代理共享连接池），`resolve_proxy(sess)` 决定用哪个
+- `SessionContext` 新增 4 个代理字段（`auth.py`），`accounts._session_from_row` 从 DB 行挂上；改代理会失效会话缓存
+- 接口：`POST /ui/accounts/proxy`（body `{uid, proxy_enabled, proxy_url, proxy_username, proxy_password?}`）
+- 注册机（DrissionPage 浏览器）的代理是**另一套**，走 `.env` 的 `QODER_REGISTRAR_PROXY` / `QODER_REGISTRAR_PROXY_URL`（见 §13），与账号级代理互不影响
+
+---
+
+## 13. 并发与连接池（2026-09-21 落地）
+
+四层防护，全部可用环境变量调整（见 `.env.example`）：
+
+| 层 | 变量 | 默认 | 作用 |
+|---|---|---|---|
+| 全局并发闸 | `QODER_MAX_CONCURRENCY` / `QODER_GATE_WAIT` | 300 / 15s | 进程级在飞请求上限；排队超过 wait 返回 429 + `Retry-After`。流式请求全程持闸，随流结束释放 |
+| 单账号并发闸 | `QODER_ACCOUNT_CONCURRENCY` / `QODER_ACCOUNT_SLOT_WAIT` | 4 / 30s | 同一账号同时在飞的上游请求上限，超出排队；等不到槽位抛 `AccountSlotBusy` 并**顺延换账号** |
+| 连接池 | `QODER_HTTP_MAX_CONNECTIONS` / `QODER_HTTP_KEEPALIVE` | 200 / 100 | 共享 `AsyncClient` 复用 TLS 连接（按代理分组），消除每请求新建 client 的握手与 TIME_WAIT churn |
+| 会话缓存 | `QODER_SESSION_CACHE_TTL` | 60s | `SessionContext`（含 sqlite 读 + RSA/AES 签名）按 uid 缓存，避免在事件循环上同步阻塞；token 刷新自动失效 |
+
+另外限流层（`ratelimit.py`）仍按 API Key 提供 RPM + 并发上限（0=不限）。

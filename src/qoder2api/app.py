@@ -1,8 +1,10 @@
 import argparse
+import asyncio
 import collections
 import json
 import os
 import sys
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -13,7 +15,7 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .auth import SessionContext, create_session, load_local_session
-from .bridge import QODER_MODELS, UpstreamErrorFrame, UpstreamHangError, complete_openai_response, stream_openai_response
+from .bridge import QODER_MODELS, AccountSlotBusy, UpstreamErrorFrame, UpstreamHangError, close_shared_client, complete_openai_response, stream_openai_response
 from .config import (
     load_config,
     save_config,
@@ -36,7 +38,10 @@ from .accounts import (
     export_accounts,
     enabled_uids,
     get_session_for_uid,
+    get_session_for_uid_cached,
+    invalidate_session_cache,
     mark_account_failed,
+    set_account_proxy,
 )
 from .registrar import get_registrar_status, start_registration, stop_registration
 from .tokens import (
@@ -55,7 +60,22 @@ INDEX_HTML = Path(BASE_DIR) / "static" / "index.html"
 CONSOLE_HTML = Path(BASE_DIR) / "static" / "console.html"
 DOCS_HTML = Path(BASE_DIR) / "static" / "docs.html"
 
-app = FastAPI(title="qoder2api-python")
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    yield
+    await close_shared_client()  # 释放共享连接池
+
+
+app = FastAPI(title="qoder2api-python", lifespan=lifespan)
+
+# ---------------------------------------------------------------------------
+# 全局并发闸：进程级在飞请求上限（含流式全程持闸），超限快速 429 + Retry-After，
+# 避免无上限并发把事件循环 / 上游连接池 / 账号配额一次性打穿。
+# ---------------------------------------------------------------------------
+GLOBAL_CONCURRENCY = max(1, int(os.getenv("QODER_MAX_CONCURRENCY", "300")))
+GLOBAL_GATE_WAIT = float(os.getenv("QODER_GATE_WAIT", "15"))
+_GATE = asyncio.Semaphore(GLOBAL_CONCURRENCY)
+
 app.mount("/assets", StaticFiles(directory=os.path.join(BASE_DIR, "static", "assets")), name="assets")
 
 _session: SessionContext | None = None
@@ -313,16 +333,51 @@ async def get_logs(verify: None = Depends(check_gateway_token)) -> list[str]:
 
 @app.post("/ui/registrar/start")
 async def registrar_start(payload: dict[str, Any] | None = None, verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
-    """启动注册机（无限循环：parents 个母线程 × 每批 3 个子任务，直到调用 stop）。
+    """启动注册机（parents 个母线程 × 每批 3 子任务，批间休眠 batch_interval 秒）。
 
-    body 可选：{"parents": 2}  —— 母线程数（1-6），每母线程 3 子任务并发。
+    body 可选：
+      {"parents": 2}                母线程数（1-6）
+      {"target_success": 0}         目标成功数，0=不限；达到后批次边界自动停
+      {"batch_interval": 20}        同一母线程两批之间的间隔（秒，0-3600）
     """
     payload = payload or {}
     try:
         parents = int(payload.get("parents", 2))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="parents 参数无效")
-    return start_registration(parents=parents)
+    try:
+        target_success = int(payload.get("target_success", 0) or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="target_success 参数无效")
+    try:
+        batch_interval = float(payload.get("batch_interval", 20))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="batch_interval 参数无效")
+    return start_registration(parents=parents, target_success=target_success,
+                              batch_interval=batch_interval)
+
+
+@app.post("/ui/accounts/proxy")
+async def set_account_proxy_api(payload: dict[str, Any], verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    """设置单个账号的上游代理：{uid, proxy_enabled, proxy_url, proxy_username, proxy_password?}
+
+    proxy_password 省略或空串 = 保留原密码不清空；代理账号/密码均可为空（无认证代理）。
+    """
+    uid = str(payload.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="uid 不能为空")
+    try:
+        result = set_account_proxy(
+            uid,
+            enabled=bool(payload.get("proxy_enabled")),
+            url=str(payload.get("proxy_url") or ""),
+            username=str(payload.get("proxy_username") or ""),
+            password=payload.get("proxy_password"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    add_log(f"Account proxy updated: {uid} enabled={result['proxy_enabled']} url={result['proxy_url'] or '-'}")
+    return {"ok": True, **result}
 
 
 @app.post("/ui/registrar/stop")
@@ -472,7 +527,7 @@ async def _pick_session(key_cfg: dict[str, Any] | None, model: str, tried: set[s
     uid = pick_uid(key_cfg["api_key"], model, int(key_cfg.get("strategy") or 1), uids, tried)
     if not uid:
         raise ValueError("No available account left for this API key.")
-    return get_session_for_uid(uid)
+    return get_session_for_uid_cached(uid)
 
 
 @app.get("/v1/models")
@@ -557,14 +612,34 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
     max_retries = max(1, enabled_count)
     tried: set[str] = set()
     handed_off = {"done": False}
+    # 全局闸状态：held=已占用；streaming=True 表示已移交给流式生成器负责释放
+    gate_state = {"held": False, "streaming": False}
+
+    # 全局并发闸：拿不到槽位快速 429，不无限排队
+    try:
+        await asyncio.wait_for(_GATE.acquire(), timeout=GLOBAL_GATE_WAIT)
+        gate_state["held"] = True
+    except asyncio.TimeoutError:
+        add_log(f"Global concurrency gate busy ({GLOBAL_CONCURRENCY}), rejecting request.", "WARNING")
+        raise HTTPException(status_code=429, detail=f"Server busy: {GLOBAL_CONCURRENCY} requests in flight",
+                            headers={"Retry-After": "5"})
+
+    def _release_gate() -> None:
+        """非流式/失败路径释放；streaming=True 时由 _releasing_stream 负责。"""
+        if gate_state["held"] and not gate_state["streaming"]:
+            gate_state["held"] = False
+            _GATE.release()
 
     async def _releasing_stream(inner):
-        """流式响应结束后释放并发名额。"""
+        """流式响应结束后释放并发名额（RPM/并发 + 全局闸）。"""
         try:
             async for chunk in inner:
                 yield chunk
         finally:
             _release()
+            if gate_state["held"]:
+                gate_state["held"] = False
+                _GATE.release()
 
     try:
         for attempt in range(max_retries):
@@ -589,6 +664,7 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
 
                     add_log(f"Streaming response initiated (Attempt {attempt+1}/{max_retries}).")
                     handed_off["done"] = True
+                    gate_state["streaming"] = True  # 闸移交给流式生成器，随流结束释放
                     return StreamingResponse(
                         _releasing_stream(stream_success_wrapper(first_item, gen)),
                         media_type="text/event-stream",
@@ -601,8 +677,8 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
                     return resp
             except Exception as exc:
                 current_uid = session_obj.identity.uid if session_obj is not None else "unknown"
-                if is_account_error(exc):
-                    if is_quota_error(exc) and not isinstance(exc, UpstreamErrorFrame):
+                if is_account_error(exc) or isinstance(exc, AccountSlotBusy):
+                    if is_quota_error(exc) and not isinstance(exc, (UpstreamErrorFrame, AccountSlotBusy)):
                         # quota 类错误：先发一次请求确认是否真正 exceeded，而不是直接跳过
                         q = get_account_quota(current_uid)
                         if q.get("ok"):
@@ -635,6 +711,7 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
     finally:
         if not handed_off["done"]:
             _release()
+        _release_gate()
 
 
 def main() -> None:

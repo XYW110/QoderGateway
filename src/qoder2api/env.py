@@ -55,6 +55,32 @@ def proxy_url() -> str | None:
     return value or None
 
 
+def registrar_proxy() -> str | None:
+    """注册机（DrissionPage 浏览器）使用的 HTTP 代理。
+
+    - QODER_REGISTRAR_PROXY=1/true 开启；关闭时注册机一律直连
+    - 地址取 QODER_REGISTRAR_PROXY_URL；未设置则回退 QODER_PROXY
+    - 开启了但两边都为空 → 返回 None（直连），由调用方记警告日志
+    """
+    if not env_bool("QODER_REGISTRAR_PROXY", False):
+        return None
+    url = (os.getenv("QODER_REGISTRAR_PROXY_URL") or os.getenv("QODER_PROXY") or "").strip()
+    return url or None
+
+
+def mail_proxy() -> str | None:
+    """临时邮箱客户端（Emailnator/YYDS）使用的 HTTP 代理。
+
+    - QODER_MAIL_PROXY=1/true 开启（默认开，保持旧行为）；关闭则邮箱直连
+    - 地址优先级：QODER_MAIL_PROXY_URL → LOCAL_PROXY → QODER_PROXY
+    - 开启了但都为空 → None（直连）
+    """
+    if not env_bool("QODER_MAIL_PROXY", True):
+        return None
+    url = (os.getenv("QODER_MAIL_PROXY_URL") or os.getenv("LOCAL_PROXY") or os.getenv("QODER_PROXY") or "").strip()
+    return url or None
+
+
 def httpx_client_kwargs() -> dict:
     proxy = proxy_url()
     return {"proxy": proxy} if proxy else {}
