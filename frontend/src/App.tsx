@@ -464,6 +464,25 @@ export default function App() {
     } catch { pushToast('ERROR', lang === 'zh' ? '导入失败' : 'Import failed', '') }
   }, [authedFetch, batchJson, lang, fetchAccounts, pushToast])
 
+  const doExportAccounts = useCallback(async () => {
+    try {
+      const resp = await authedFetch('/ui/accounts/export?download=0')
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+      const text = await resp.text()
+      const arr = JSON.parse(text) as unknown[]
+      const stamp = new Date().toISOString().replace(/[-:]/g, '').slice(0, 15).replace('T', '-')
+      const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }))
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `qoder-accounts-${stamp}.json`
+      document.body.appendChild(a); a.click(); a.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+      pushToast('SUCCESS', lang === 'zh' ? `已导出 ${arr.length} 个账号` : `Exported ${arr.length} accounts`, lang === 'zh' ? '含邮箱/密码/token，请妥善保管' : 'Includes email/password/token')
+    } catch (e) {
+      pushToast('ERROR', lang === 'zh' ? '导出失败' : 'Export failed', String(e))
+    }
+  }, [authedFetch, lang, pushToast])
+
   const doRefreshTokens = useCallback(async () => {
     setRefreshingTokens(true)
     try {
@@ -966,6 +985,9 @@ export default function App() {
               <section className="flex justify-between items-end flex-wrap gap-4">
                 <div className="max-w-xl"><p className="text-body text-[16px]">{t.accounts.desc}</p></div>
                 <div className="flex gap-4 flex-wrap">
+                  <button onClick={doExportAccounts} className="flex items-center gap-2 px-4 py-2.5 rounded-lg transition-all font-bold text-sm border text-body hover:text-ink border-hairline">
+                    <span className="material-symbols-outlined text-[18px]">file_download</span>{lang === 'zh' ? '导出账号' : 'Export'}
+                  </button>
                   <button onClick={() => { setShowBatchImport(v => !v); setQuotaList(null) }} className={`flex items-center gap-2 px-4 py-2.5 rounded-lg transition-all font-bold text-sm border ${showBatchImport ? 'bg-ink text-white border-ink' : 'text-body hover:text-ink border-hairline'}`}>
                     <span className="material-symbols-outlined text-[18px]">file_upload</span>{lang === 'zh' ? '批量导入' : 'Batch Import'}
                   </button>

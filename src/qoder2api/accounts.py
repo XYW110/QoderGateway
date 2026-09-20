@@ -1,4 +1,5 @@
 import copy
+import time
 import uuid
 from typing import Any
 
@@ -36,6 +37,9 @@ def db_load_accounts() -> dict[str, Any]:
             account.pop("security_oauth_token", None)
             account.pop("refresh_token", None)
             account.pop("machine_id", None)
+            # 密码已落库，但默认不随接口下发（避免明文经 HTTP/前端日志外泄）；
+            # 需要展示时改用 /ui/accounts?with_secrets=1 或直接查库
+            account.pop("password", None)
             accounts.append(account)
         active_uid = db_get_settings("active_uid")
         return {"accounts": accounts, "active_uid": active_uid}
@@ -110,6 +114,37 @@ async def import_current_auth() -> dict[str, Any]:
     }
 
 
+def export_accounts(include_secrets: bool = True) -> list[dict]:
+    """导出账号池为「注册机 accounts.json」兼容的数组，可被 /ui/accounts/batch-import 原样回灌。
+
+    include_secrets=False 时剔除 password / token / refresh_token / machine_id，
+    只保留可对外分享的元数据。
+    """
+    exported_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM accounts ORDER BY rowid").fetchall()
+    out: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        rec: dict[str, Any] = {
+            "email": d.get("email"),
+            "name": d.get("name"),
+            "user_id": d.get("uid"),
+            "expires_at": d.get("token_expires_at"),
+            "enabled": d.get("enabled"),
+            "plan": d.get("plan"),
+            "user_tag": d.get("user_tag"),
+            "exported_at": exported_at,
+        }
+        if include_secrets:
+            rec["password"] = d.get("password")
+            rec["token"] = d.get("security_oauth_token")
+            rec["refresh_token"] = d.get("refresh_token")
+            rec["machine_id"] = d.get("machine_id")
+        out.append(rec)
+    return out
+
+
 def batch_import_accounts(records: list[dict]) -> dict:
     """批量导入账号（来自注册机导出的 JSON）。
 
@@ -128,31 +163,48 @@ def batch_import_accounts(records: list[dict]) -> dict:
             if not uid:
                 # 无 user_id 时用 token 前 12 位兜底主键
                 uid = "tok_" + token[:24]
-            existing = conn.execute("SELECT enabled FROM accounts WHERE uid = ?", (uid,)).fetchone()
-            enabled = existing[0] if existing else 1
+            existing = conn.execute(
+                "SELECT enabled, email, password, machine_id FROM accounts WHERE uid = ?", (uid,)
+            ).fetchone()
+            enabled = existing["enabled"] if existing else 1
+            # 记录未带这些字段时保留库内旧值：INSERT OR REPLACE 是整行覆盖，
+            # 不带就会把已落库的 email/password/machine_id 清空。
+            email = str(rec.get("email") or "").strip() or (
+                existing["email"] if existing else None)
+            password = str(rec.get("password") or "").strip() or (
+                existing["password"] if existing else None)
+            machine_id = str(rec.get("machine_id") or "").strip() or (
+                existing["machine_id"] if existing else str(uuid.uuid4()))
             conn.execute(
                 """
                 INSERT OR REPLACE INTO accounts (
-                    uid, name, user_type, security_oauth_token, refresh_token, machine_id,
+                    uid, name, user_type, email, password,
+                    security_oauth_token, refresh_token, machine_id,
                     enabled, last_status, last_error, quota, is_quota_exceeded, plan, user_tag, next_reset_at, token_expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ok', NULL, 0, 0, 'PLAN_TIER_PRO_TRIAL', 'Pro Trial', NULL, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ok', NULL, 0, 0, 'PLAN_TIER_PRO_TRIAL', 'Pro Trial', NULL, ?)
                 """,
                 (
                     uid,
                     str(rec.get("name") or rec.get("email") or "Imported"),
                     "personal_standard",
+                    email,
+                    password,
                     token,
                     str(rec.get("refresh_token") or ""),
-                    str(uuid.uuid4()),
+                    machine_id,
                     enabled,
                     str(rec.get("expires_at") or ""),
                 ),
             )
             imported += 1
-        if not db_get_settings("active_uid"):
-            active = conn.execute("SELECT uid FROM accounts WHERE enabled = 1 LIMIT 1").fetchone()
-            if active:
-                db_set_settings("active_uid", active["uid"])
+    # active_uid 的兜底必须放在写事务之外：在事务内再开库写会争锁
+    # （实测 sqlite3.OperationalError: database is locked，busy_timeout 30s 后放弃）
+    if not db_get_settings("active_uid"):
+        with get_db() as conn:
+            active = conn.execute(
+                "SELECT uid FROM accounts WHERE enabled = 1 LIMIT 1").fetchone()
+        if active:
+            db_set_settings("active_uid", active["uid"])
     return {"imported": imported, "skipped": skipped}
 
 

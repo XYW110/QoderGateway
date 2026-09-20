@@ -1,5 +1,6 @@
 import argparse
 import collections
+import json
 import os
 from datetime import datetime
 from pathlib import Path
@@ -7,7 +8,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Header, Depends
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .auth import SessionContext, create_session, load_local_session
@@ -23,6 +24,7 @@ from .accounts import (
     get_active_session,
     rotate_next_account,
     batch_import_accounts,
+    export_accounts,
 )
 from .registrar import get_registrar_status, start_registration, stop_registration
 from .tokens import (
@@ -181,6 +183,27 @@ async def status(verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
 @app.get("/ui/accounts")
 async def get_accounts(verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
     return db_load_accounts()
+
+
+@app.get("/ui/accounts/export")
+async def export_accounts_endpoint(
+    download: int = 1,
+    include_secrets: int = 1,
+    verify: None = Depends(check_gateway_token),
+) -> Response:
+    """导出账号池：注册机 accounts.json 兼容的数组，可直接被 /ui/accounts/batch-import 回灌。
+
+    download=0 返回内联 JSON；include_secrets=0 剔除 password / token / refresh_token。
+    """
+    records = export_accounts(include_secrets=bool(include_secrets))
+    body = json.dumps(records, ensure_ascii=False, indent=2)
+    headers: dict[str, str] = {}
+    if download:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        headers["Content-Disposition"] = (
+            f'attachment; filename="qoder-accounts-{stamp}.json"')
+    add_log(f"Exported {len(records)} accounts (include_secrets={bool(include_secrets)})")
+    return Response(content=body, media_type="application/json", headers=headers)
 
 
 @app.post("/ui/accounts/import")
