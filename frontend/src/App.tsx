@@ -318,6 +318,22 @@ function ToastContainer({ toasts, dismiss }: { toasts: ToastItem[]; dismiss: (id
 
 // ─── Main App ───
 
+// Qoder 模型目录（与后端 bridge.QODER_MODELS 一致，参照 keirouter）
+const QODER_MODEL_OPTIONS: { value: string; label: string }[] = [
+  { value: 'auto', label: 'Auto（自动）' },
+  { value: 'ultimate', label: 'Ultimate（旗舰）' },
+  { value: 'performance', label: 'Performance（性能）' },
+  { value: 'efficient', label: 'Efficient（高效）' },
+  { value: 'lite', label: 'Lite（轻量）' },
+  { value: 'qmodel', label: 'Q Model' },
+  { value: 'qmodel_latest', label: 'Q Model (Latest)' },
+  { value: 'dmodel', label: 'D Model' },
+  { value: 'dfmodel', label: 'DF Model' },
+  { value: 'gm51model', label: 'GM 5.1 Model' },
+  { value: 'kmodel', label: 'K Model' },
+  { value: 'mmodel', label: 'M Model' },
+]
+
 export default function App() {
   const [lang, setLang] = useState<Lang>(() => {
     const stored = localStorage.getItem('qodergate_lang')
@@ -1185,7 +1201,7 @@ export default function App() {
               <section className="w-[320px] flex flex-col gap-6 overflow-y-auto pr-4">
                 <div className="space-y-3">
                   <label className="font-bold text-ink">{t.playground.modelConfig}</label>
-                  <CustomInput value={model} onChange={setModel} placeholder="e.g. lite, pro" />
+                  <CustomSelect value={model} onChange={setModel} options={QODER_MODEL_OPTIONS} placeholder="e.g. lite" />
                 </div>
                 <div className="space-y-3">
                   <CustomCheckbox checked={stream} onChange={setStream} label={t.playground.streamResponse} />
