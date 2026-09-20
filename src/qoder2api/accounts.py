@@ -293,3 +293,49 @@ def rotate_next_account(failed_uid: str, error_msg: str) -> SessionContext:
         machine_token,
         machine_type
     )
+
+
+# ---------------------------------------------------------------------------
+# 按 key 路由所需的辅助（不改全局 active_uid）
+# ---------------------------------------------------------------------------
+def _session_from_row(account: dict) -> SessionContext:
+    """由 accounts 表的一行构造会话。"""
+    identity = AuthIdentity(
+        name=account["name"],
+        aid=account["uid"],
+        uid=account["uid"],
+        yx_uid="",
+        organization_id="",
+        organization_name="",
+        user_type=account["user_type"],
+        security_oauth_token=account["security_oauth_token"],
+        refresh_token=account["refresh_token"],
+    )
+    _, machine_token, machine_type = new_machine()
+    return new_session(identity, account["machine_id"], machine_token, machine_type)
+
+
+def enabled_uids() -> list[str]:
+    """已启用账号的 uid（稳定排序，供路由 hash 取模 / 轮询取用）。"""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT uid FROM accounts WHERE enabled = 1 ORDER BY uid").fetchall()
+    return [r[0] for r in rows]
+
+
+def get_session_for_uid(uid: str) -> SessionContext:
+    """按 uid 取会话；账号不存在或被停用则抛错。"""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM accounts WHERE uid = ? AND enabled = 1", (uid,)).fetchone()
+    if not row:
+        raise ValueError(f"Account {uid} not found or disabled.")
+    return _session_from_row(dict(row))
+
+
+def mark_account_failed(uid: str, error_msg: str) -> None:
+    """只记录失败状态，不改变全局 active_uid（按 key 路由时使用）。"""
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE accounts SET last_status = 'failed', last_error = ? WHERE uid = ?",
+            (error_msg, uid))

@@ -50,7 +50,13 @@ def init_db():
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS allowed_keys (
-                api_key TEXT PRIMARY KEY
+                api_key TEXT PRIMARY KEY,
+                name TEXT,
+                strategy INTEGER DEFAULT 1,
+                rpm_limit INTEGER DEFAULT 0,
+                concurrency_limit INTEGER DEFAULT 0,
+                enabled INTEGER DEFAULT 1,
+                created_at TEXT
             )
             """
         )
@@ -86,6 +92,21 @@ def init_db():
         for _ddl in (
             "ALTER TABLE accounts ADD COLUMN email TEXT",
             "ALTER TABLE accounts ADD COLUMN password TEXT",
+        ):
+            try:
+                conn.execute(_ddl)
+            except Exception:
+                pass
+
+        # allowed_keys 扩展列：名称 / 路由策略 / RPM / 并发 / 启用（幂等，老库自动补齐）
+        # strategy: 1=填充(同 key+模型固定账号) 2=轮询(每次请求依次下一个)；limit 0=不限
+        for _ddl in (
+            "ALTER TABLE allowed_keys ADD COLUMN name TEXT",
+            "ALTER TABLE allowed_keys ADD COLUMN strategy INTEGER DEFAULT 1",
+            "ALTER TABLE allowed_keys ADD COLUMN rpm_limit INTEGER DEFAULT 0",
+            "ALTER TABLE allowed_keys ADD COLUMN concurrency_limit INTEGER DEFAULT 0",
+            "ALTER TABLE allowed_keys ADD COLUMN enabled INTEGER DEFAULT 1",
+            "ALTER TABLE allowed_keys ADD COLUMN created_at TEXT",
         ):
             try:
                 conn.execute(_ddl)

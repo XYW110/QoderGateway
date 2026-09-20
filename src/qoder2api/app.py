@@ -13,9 +13,17 @@ from fastapi.staticfiles import StaticFiles
 
 from .auth import SessionContext, create_session, load_local_session
 from .bridge import complete_openai_response, stream_openai_response
-from .config import load_config, save_config
+from .config import (
+    load_config,
+    save_config,
+    list_api_keys,
+    upsert_api_key,
+    delete_api_key,
+)
 from .database import get_db
 from .env import env_bool
+from . import ratelimit
+from .routing import pick_uid
 from .accounts import (
     db_load_accounts,
     db_get_settings,
@@ -25,6 +33,9 @@ from .accounts import (
     rotate_next_account,
     batch_import_accounts,
     export_accounts,
+    enabled_uids,
+    get_session_for_uid,
+    mark_account_failed,
 )
 from .registrar import get_registrar_status, start_registration, stop_registration
 from .tokens import (
@@ -334,6 +345,41 @@ async def post_ui_config(payload: dict[str, Any], verify: None = Depends(check_g
     return {"status": "ok"}
 
 
+@app.get("/ui/keys")
+async def list_keys(verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    """列出 API Key（含名称/路由策略/限额/实时用量）。"""
+    keys = list_api_keys()
+    for k in keys:
+        k.update(ratelimit.usage(k["api_key"]))
+    return {"keys": keys, "auth_required": bool(load_config().get("auth_required"))}
+
+
+@app.post("/ui/keys")
+async def save_key(payload: dict[str, Any], verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    """新增/更新一条 API Key。
+
+    字段：api_key（必填）、name、strategy（1=填充/固定 2=轮询）、
+    rpm_limit、concurrency_limit（0=不限）、enabled
+    """
+    try:
+        rec = upsert_api_key(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    add_log(f"API Key saved: {rec['api_key'][:8]}... name={rec['name']!r} "
+            f"strategy={rec['strategy']} rpm={rec['rpm_limit']} "
+            f"conc={rec['concurrency_limit']} enabled={rec['enabled']}")
+    rec.update(ratelimit.usage(rec["api_key"]))
+    return {"status": "ok", "key": rec}
+
+
+@app.delete("/ui/keys/{api_key}")
+async def remove_key(api_key: str, verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    if not delete_api_key(api_key):
+        raise HTTPException(status_code=404, detail="API Key not found")
+    add_log(f"API Key deleted: {api_key[:8]}...")
+    return {"status": "ok"}
+
+
 @app.post("/ui/session")
 async def set_session(payload: dict[str, Any], verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
     global _local_auth_error
@@ -400,85 +446,149 @@ def is_account_error(exc: Exception) -> bool:
     return False
 
 
+async def _pick_session(key_cfg: dict[str, Any] | None, model: str, tried: set[str]):
+    """按 API Key 的路由策略挑选本次请求使用的账号。
+
+    - 无 key（或未开鉴权且未带 key）：沿用原有 active 账号逻辑
+    - 有 key：按 strategy 从「已启用账号」中挑选；tried 里的账号会被跳过（失败重试顺延）
+    """
+    if not key_cfg:
+        return await get_session()
+    uids = enabled_uids()
+    if not uids:
+        return await get_session()
+    uid = pick_uid(key_cfg["api_key"], model, int(key_cfg.get("strategy") or 1), uids, tried)
+    if not uid:
+        raise ValueError("No available account left for this API key.")
+    return get_session_for_uid(uid)
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(payload: dict[str, Any], authorization: str | None = Header(default=None)):
     config = load_config()
-    if config.get("auth_required", False):
-        allowed_keys = config.get("allowed_keys", [])
-        incoming_key = None
-        if authorization and authorization.startswith("Bearer "):
-            incoming_key = authorization[len("Bearer "):].strip()
-        
-        if not incoming_key or incoming_key not in allowed_keys:
-            add_log("Access denied: Invalid or missing API Key in request header.", "WARNING")
-            raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+    auth_required = bool(config.get("auth_required", False))
+
+    # ---- 解析调用方 API Key（未开鉴权时也允许带 key，以便启用策略/限流）----
+    incoming_key = ""
+    if authorization and authorization.startswith("Bearer "):
+        incoming_key = authorization[len("Bearer "):].strip()
+    key_cfg: dict[str, Any] | None = None
+    for _k in config.get("api_keys", []):
+        if _k.get("api_key") and _k.get("api_key") == incoming_key and _k.get("enabled"):
+            key_cfg = _k
+            break
+    if auth_required and not key_cfg:
+        add_log("Access denied: Invalid or missing API Key in request header.", "WARNING")
+        raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+
+    # ---- 限流：RPM + 并发（0=不限）。并发名额必须在请求/流结束后释放 ----
+    released = {"done": False}
+
+    def _release() -> None:
+        if key_cfg and not released["done"]:
+            released["done"] = True
+            ratelimit.release(key_cfg["api_key"])
+
+    if key_cfg:
+        _ok, _reason, _retry_after = ratelimit.acquire(
+            key_cfg["api_key"], key_cfg.get("rpm_limit", 0),
+            key_cfg.get("concurrency_limit", 0))
+        if not _ok:
+            add_log(f"Rate limited (key={key_cfg['api_key'][:8]}...): {_reason}", "WARNING")
+            raise HTTPException(status_code=429, detail=_reason,
+                                headers={"Retry-After": str(int(_retry_after) + 1)})
 
     model = payload.get("model", "lite")
     stream = bool(payload.get("stream", False))
     messages_count = len(payload.get("messages", []))
-    add_log(f"Incoming completion request: model={model}, stream={stream}, messages={messages_count}")
-    
+    add_log(f"Incoming completion request: model={model}, stream={stream}, messages={messages_count}"
+            + (f", key={key_cfg['api_key'][:8]}... strategy={key_cfg['strategy']}"
+               f" rpm={key_cfg.get('rpm_limit')} conc={key_cfg.get('concurrency_limit')}"
+               if key_cfg else ", no-key"))
+
     accounts_data = db_load_accounts()
     enabled_count = sum(1 for acc in accounts_data["accounts"] if acc.get("enabled", True))
     max_retries = max(1, enabled_count)
-    
-    for attempt in range(max_retries):
+    tried: set[str] = set()
+    handed_off = {"done": False}
+
+    async def _releasing_stream(inner):
+        """流式响应结束后释放并发名额。"""
         try:
-            sess = await get_session()
-            add_log(f"Request routing via account: {sess.identity.name} ({sess.identity.uid})")
-            if stream:
-                gen = stream_openai_response(payload, sess)
-                try:
-                    first_item = await gen.__anext__()
-                except StopAsyncIteration:
-                    first_item = None
-                
-                async def stream_success_wrapper(first, g):
-                    if first is not None:
-                        yield first
-                    async for chunk in g:
-                        yield chunk
-                
-                add_log(f"Streaming response initiated (Attempt {attempt+1}/{max_retries}).")
-                return StreamingResponse(
-                    stream_success_wrapper(first_item, gen),
-                    media_type="text/event-stream",
-                    headers={"Cache-Control": "no-cache"}
-                )
-            else:
-                add_log(f"Generating full completion response (Attempt {attempt+1}/{max_retries})...")
-                resp = await complete_openai_response(payload, sess)
-                add_log("Completion request finished successfully.")
-                return resp
-        except Exception as exc:
-            current_uid = sess.identity.uid if 'sess' in locals() else "unknown"
-            if is_account_error(exc):
-                if is_quota_error(exc):
-                    # quota 类错误：先发一次请求确认是否真正 exceeded，而不是直接跳过
-                    q = get_account_quota(current_uid)
-                    if q.get("ok"):
-                        quota = q["quota"]
-                        truly_exceeded = bool(quota.get("isQuotaExceeded")) or (quota.get("userQuota") or {}).get("remaining", 1) <= 0
-                        if not truly_exceeded:
-                            add_log(f"Quota check on {current_uid}: NOT exceeded (remaining={quota.get('userQuota', {}).get('remaining')}), not rotating.", "WARNING")
-                            raise HTTPException(status_code=502, detail=f"{exc}")
-                        add_log(f"Quota confirmed exceeded for {current_uid}: {exc}. Rotating...", "WARNING")
-                    else:
-                        # 限额查询失败：无法确认，保守不跳过账户
-                        add_log(f"Quota check failed for {current_uid} ({q.get('error')}), not rotating.", "WARNING")
-                        raise HTTPException(status_code=502, detail=f"{exc}")
+            async for chunk in inner:
+                yield chunk
+        finally:
+            _release()
+
+    try:
+        for attempt in range(max_retries):
+            session_obj = None
+            try:
+                session_obj = await _pick_session(key_cfg, model, tried)
+                tried.add(session_obj.identity.uid)
+                add_log(f"Request routing via account: {session_obj.identity.name} "
+                        f"({session_obj.identity.uid})")
+                if stream:
+                    gen = stream_openai_response(payload, session_obj)
+                    try:
+                        first_item = await gen.__anext__()
+                    except StopAsyncIteration:
+                        first_item = None
+
+                    async def stream_success_wrapper(first, g):
+                        if first is not None:
+                            yield first
+                        async for chunk in g:
+                            yield chunk
+
+                    add_log(f"Streaming response initiated (Attempt {attempt+1}/{max_retries}).")
+                    handed_off["done"] = True
+                    return StreamingResponse(
+                        _releasing_stream(stream_success_wrapper(first_item, gen)),
+                        media_type="text/event-stream",
+                        headers={"Cache-Control": "no-cache"}
+                    )
                 else:
-                    add_log(f"Account-level error on {current_uid}: {exc}. Rotating to next account...", "WARNING")
-                try:
-                    rotate_next_account(current_uid, str(exc))
-                except Exception as e:
-                    add_log(f"Failed to rotate account: {e}", "ERROR")
-                    raise HTTPException(status_code=502, detail=f"Request failed and no other account is available. Error: {exc}")
-            else:
-                add_log(f"Transient error on account {current_uid}: {exc}. Not rotating account.", "WARNING")
-                raise HTTPException(status_code=502, detail=str(exc))
-                
-    raise HTTPException(status_code=502, detail="Request failed on all available accounts.")
+                    add_log(f"Generating full completion response (Attempt {attempt+1}/{max_retries})...")
+                    resp = await complete_openai_response(payload, session_obj)
+                    add_log("Completion request finished successfully.")
+                    return resp
+            except Exception as exc:
+                current_uid = session_obj.identity.uid if session_obj is not None else "unknown"
+                if is_account_error(exc):
+                    if is_quota_error(exc):
+                        # quota 类错误：先发一次请求确认是否真正 exceeded，而不是直接跳过
+                        q = get_account_quota(current_uid)
+                        if q.get("ok"):
+                            quota = q["quota"]
+                            truly_exceeded = bool(quota.get("isQuotaExceeded")) or (quota.get("userQuota") or {}).get("remaining", 1) <= 0
+                            if not truly_exceeded:
+                                add_log(f"Quota check on {current_uid}: NOT exceeded (remaining={quota.get('userQuota', {}).get('remaining')}), not rotating.", "WARNING")
+                                raise HTTPException(status_code=502, detail=f"{exc}")
+                            add_log(f"Quota confirmed exceeded for {current_uid}: {exc}. Rotating...", "WARNING")
+                        else:
+                            # 限额查询失败：无法确认，保守不跳过账户
+                            add_log(f"Quota check failed for {current_uid} ({q.get('error')}), not rotating.", "WARNING")
+                            raise HTTPException(status_code=502, detail=f"{exc}")
+                    else:
+                        add_log(f"Account-level error on {current_uid}: {exc}. Rotating to next account...", "WARNING")
+                    try:
+                        if key_cfg:
+                            # 按 key 路由：只标记失败，不改动全局 active_uid
+                            mark_account_failed(current_uid, str(exc))
+                        else:
+                            rotate_next_account(current_uid, str(exc))
+                    except Exception as e:
+                        add_log(f"Failed to rotate account: {e}", "ERROR")
+                        raise HTTPException(status_code=502, detail=f"Request failed and no other account is available. Error: {exc}")
+                else:
+                    add_log(f"Transient error on account {current_uid}: {exc}. Not rotating account.", "WARNING")
+                    raise HTTPException(status_code=502, detail=str(exc))
+
+        raise HTTPException(status_code=502, detail="Request failed on all available accounts.")
+    finally:
+        if not handed_off["done"]:
+            _release()
 
 
 def main() -> None:
