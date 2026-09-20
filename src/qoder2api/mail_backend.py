@@ -45,6 +45,14 @@ def _mail_backend() -> str:
 
 
 def _import_emailnator():
+    # 优先使用包内收编版（exe/Docker 均自动包含）；
+    # 回退到 temp/channel_mail 外挂模块（历史布局，便于热替换调试）。
+    try:
+        from .mail_client import EmailnatorClient
+        from .mail_client.email_api import generate_email
+        return generate_email, EmailnatorClient
+    except ImportError:
+        pass
     root = str(_CHANNEL_MAIL)
     if root not in sys.path:
         sys.path.insert(0, root)
